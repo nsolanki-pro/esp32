@@ -1,0 +1,81 @@
+# Build the firmware in Espressif's ESP-IDF container.
+#   - push a tag v*  -> build both variants and publish a GitHub release with the binaries
+#   - manual run     -> build both variants; binaries are attached to the run as artifacts
+name: Build firmware
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write  # create the release on tag pushes
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v6.0.3
+    strategy:
+      matrix:
+        variant: [default, motion]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history + tags: the firmware version comes from git describe
+
+      - name: Build
+        shell: bash
+        working-directory: firmware
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"  # container runs as another user
+          . "$IDF_PATH/export.sh"
+          if [ "${{ matrix.variant }}" = motion ]; then
+            idf.py -D SDKCONFIG=build/sdkconfig -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.motion" build merge-bin
+          else
+            idf.py build merge-bin
+          fi
+
+      - name: Collect binaries
+        shell: bash
+        run: |
+          version=$(git describe --tags --always --dirty)
+          name=esp32-$version
+          [ "${{ matrix.variant }}" = motion ] && name=$name-motion
+          mkdir dist
+          cp firmware/build/esp32_status.bin "dist/$name-ota.bin"      # OTA: /update page or ota.sh
+          cp firmware/build/merged-binary.bin "dist/$name-full.bin"    # USB: flash at 0x0
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.variant }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          sha256sum *.bin > SHA256SUMS
+          cat > notes.md <<'EOF'
+          **Files**
+          - `*-ota.bin`: app image for over-the-air updates (`/update` page or `ota.sh`)
+          - `*-full.bin`: complete flash image for a new or erased board, written over USB at offset 0:
+            `esptool.py --chip esp32 -b 115200 write_flash 0x0 esp32-<version>-full.bin`
+          - `*-motion-*`: CSI motion-sensor build (radio always on, no light sleep)
+
+          After flashing, the board opens the setup network `ESP32-Setup-XXXX` (password `esp32setupXXXX`).
+          EOF
+          gh release create "$GITHUB_REF_NAME" *.bin SHA256SUMS --title "$GITHUB_REF_NAME" --notes-file notes.md --generate-notes
