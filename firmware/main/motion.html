@@ -30,6 +30,13 @@ async function tick() {
   busy = true;
   try {
     const m = await (await fetch('/api/motion')).json();
+    if (!m.enabled) {
+      $('st').textContent = 'Sensor off';
+      $('st').className = '';
+      $('info').innerHTML = 'Turn on <b>Wi-Fi motion sensor</b> in <a href="/settings">Settings</a>.';
+      busy = false;
+      return;
+    }
     m.threshold = m.baseline * m.sens;
     H.push(m);
     if (H.length > N) H.shift();

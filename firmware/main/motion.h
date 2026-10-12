@@ -16,9 +16,16 @@ typedef struct {
     int64_t last_motion_s_ago;  // -1 if never
 } motion_status_t;
 
-// Call on every IP_EVENT_STA_GOT_IP. Starts CSI + traffic to the gateway the first time,
-// and re-reads the AP BSSID on every reconnect.
+void motion_init(void);
+
+// Call on every IP_EVENT_STA_GOT_IP / disconnect. While enabled, CSI and the gateway pings run
+// whenever the station is connected.
 void motion_on_connected(esp_ip4_addr_t gateway);
+void motion_on_disconnected(void);
+
+// Turn sensing on or off at runtime. The caller handles power save (radio must stay on).
+void motion_enable(bool on);
+bool motion_enabled(void);
 void motion_get(motion_status_t *out);
 bool motion_active(void);
 void motion_set_sens(float sens);

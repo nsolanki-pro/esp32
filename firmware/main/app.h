@@ -15,6 +15,9 @@ void app_apply_tz(void);
 // Local time as "YYYY-MM-DD HH:MM:SS TZ"; false (and "not synced") before the first NTP sync.
 bool app_time_str(char *buf, size_t len);
 
+// settings()->motion changed: start/stop the CSI sensor and switch power saving accordingly.
+void app_apply_motion(void);
+
 // The LED mode changed.
 void app_led_changed(void);
 

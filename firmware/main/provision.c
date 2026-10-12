@@ -74,7 +74,7 @@ void prov_set_sta(const char *ssid, const char *pass)
     strlcpy((char *)c.sta.ssid, ssid, sizeof(c.sta.ssid));
     strlcpy((char *)c.sta.password, pass, sizeof(c.sta.password));
     c.sta.threshold.authmode = pass[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-    c.sta.listen_interval = settings_listen();  // 0 (motion build) = driver default
+    c.sta.listen_interval = settings_listen();
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &c));
 }
 

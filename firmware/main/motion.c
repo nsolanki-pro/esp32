@@ -5,6 +5,9 @@
 // changes the multipath, so subcarrier amplitudes start to fluctuate. Score = mean over subcarriers
 // of the amplitude std-dev over the last 1 s (amplitudes normalised per frame to cancel AGC gain
 // steps). Motion = score above an adaptive empty-room baseline times a sensitivity factor.
+//
+// Runs only while enabled (settings, motion_enable()): the 50 Hz pings and CSI keep the radio and
+// CPU busy, so the caller also turns light sleep and Wi-Fi power save off for that time.
 
 #include "motion.h"
 
@@ -12,10 +15,12 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include <stdlib.h>
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/ip_addr.h"
 #include "ping/ping_sock.h"
@@ -37,7 +42,12 @@ typedef struct {
 
 static QueueHandle_t s_queue;
 static uint8_t s_bssid[6];
-static bool s_started;
+static bool s_enabled;
+static bool s_connected;
+static esp_ip4_addr_t s_gw;
+static esp_ping_handle_t s_ping;
+static SemaphoreHandle_t s_lock;  // start/stop come from the event task and HTTP handlers
+static volatile bool s_reset;  // ask the processing task to start over (fresh window and baseline)
 
 static float s_score, s_baseline, s_sens = 2.0f;
 static bool s_motion;
@@ -63,16 +73,23 @@ static void csi_cb(void *ctx, wifi_csi_info_t *info)
 
 static void process_task(void *arg)
 {
-    static float win[WIN][NSUB];
+    float (*win)[NSUB] = malloc(sizeof(float[WIN][NSUB]));  // 10 KB, only once motion is first used
+    configASSERT(win);
     int idx = 0, filled = 0;
     uint32_t frames = 0;
     int64_t rate_t0 = esp_timer_get_time();
     csi_frame_t f;
 
     for (;;) {
-        if (xQueueReceive(s_queue, &f, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        if (xQueueReceive(s_queue, &f, s_enabled ? pdMS_TO_TICKS(1000) : portMAX_DELAY) != pdTRUE) {
             s_rate = 0;
             continue;
+        }
+        if (s_reset) {
+            s_reset = false;
+            idx = filled = 0;
+            s_baseline = s_score = 0;
+            s_motion = false;
         }
         int64_t now = esp_timer_get_time();
         frames++;
@@ -134,43 +151,107 @@ static void process_task(void *arg)
     }
 }
 
-void motion_on_connected(esp_ip4_addr_t gateway)
+static void ping_stop(void)
+{
+    if (s_ping) {
+        esp_ping_stop(s_ping);
+        esp_ping_delete_session(s_ping);
+        s_ping = NULL;
+    }
+}
+
+// Steady stream of frames from the AP: ping the gateway every PING_MS.
+static void ping_start(void)
+{
+    ping_stop();
+    esp_ping_config_t pcfg = ESP_PING_DEFAULT_CONFIG();
+    pcfg.count = ESP_PING_COUNT_INFINITE;
+    pcfg.interval_ms = PING_MS;
+    pcfg.data_size = 8;
+    ip_addr_set_ip4_u32(&pcfg.target_addr, s_gw.addr);  // works with or without IPv6
+    esp_ping_callbacks_t cbs = {0};
+    if (esp_ping_new_session(&pcfg, &cbs, &s_ping) != ESP_OK || esp_ping_start(s_ping) != ESP_OK) {
+        ESP_LOGE(TAG, "could not start pinging the gateway");
+        ping_stop();
+    }
+}
+
+static void csi_start(void)
 {
     wifi_ap_record_t ap;
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
         memcpy(s_bssid, ap.bssid, 6);
     }
-    if (s_started) {
-        return;
+    if (!s_queue) {
+        s_queue = xQueueCreate(16, sizeof(csi_frame_t));
+        xTaskCreate(process_task, "motion", 4096, NULL, 3, NULL);
+        wifi_csi_config_t cfg = {
+            .lltf_en = true,
+            .htltf_en = false,
+            .stbc_htltf2_en = false,
+            .ltf_merge_en = false,
+            .channel_filter_en = false,  // keep subcarriers independent
+            .manu_scale = false,
+        };
+        ESP_ERROR_CHECK(esp_wifi_set_csi_config(&cfg));
+        ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(csi_cb, NULL));
     }
-    s_started = true;
+    s_reset = true;
+    esp_wifi_set_csi(true);
+    ping_start();
+    ESP_LOGI(TAG, "CSI motion sensing started (gateway " IPSTR ", %d Hz)", IP2STR(&s_gw), 1000 / PING_MS);
+}
 
-    s_queue = xQueueCreate(16, sizeof(csi_frame_t));
-    xTaskCreate(process_task, "motion", 4096, NULL, 3, NULL);
+static void csi_stop(void)
+{
+    ping_stop();
+    esp_wifi_set_csi(false);
+    s_motion = false;
+    s_rate = 0;
+}
 
-    wifi_csi_config_t cfg = {
-        .lltf_en = true,
-        .htltf_en = false,
-        .stbc_htltf2_en = false,
-        .ltf_merge_en = false,
-        .channel_filter_en = false,  // keep subcarriers independent
-        .manu_scale = false,
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(csi_cb, NULL));
-    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+void motion_init(void)
+{
+    s_lock = xSemaphoreCreateMutex();
+}
 
-    // Steady stream of frames from the AP: ping the gateway every PING_MS.
-    esp_ping_config_t pcfg = ESP_PING_DEFAULT_CONFIG();
-    pcfg.count = ESP_PING_COUNT_INFINITE;
-    pcfg.interval_ms = PING_MS;
-    pcfg.data_size = 8;
-    ip_addr_set_ip4_u32(&pcfg.target_addr, gateway.addr);  // works with or without IPv6
-    esp_ping_callbacks_t cbs = {0};
-    esp_ping_handle_t ping;
-    ESP_ERROR_CHECK(esp_ping_new_session(&pcfg, &cbs, &ping));
-    ESP_ERROR_CHECK(esp_ping_start(ping));
-    ESP_LOGI(TAG, "CSI motion sensing started (gateway " IPSTR ", %d Hz)", IP2STR(&gateway), 1000 / PING_MS);
+void motion_on_connected(esp_ip4_addr_t gateway)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_gw = gateway;
+    s_connected = true;
+    if (s_enabled) {
+        csi_start();  // re-read the BSSID and ping the (possibly new) gateway
+    }
+    xSemaphoreGive(s_lock);
+}
+
+void motion_on_disconnected(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_connected = false;
+    ping_stop();
+    xSemaphoreGive(s_lock);
+}
+
+void motion_enable(bool on)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (on != s_enabled) {
+        s_enabled = on;
+        if (on && s_connected) {
+            csi_start();
+        } else if (!on) {
+            csi_stop();
+            ESP_LOGI(TAG, "CSI motion sensing stopped");
+        }
+    }
+    xSemaphoreGive(s_lock);
+}
+
+bool motion_enabled(void)
+{
+    return s_enabled;
 }
 
 void motion_get(motion_status_t *out)
@@ -186,7 +267,7 @@ void motion_get(motion_status_t *out)
 
 bool motion_active(void)
 {
-    return s_motion;
+    return s_enabled && s_motion;
 }
 
 void motion_set_sens(float sens)

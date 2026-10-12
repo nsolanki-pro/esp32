@@ -16,9 +16,9 @@
 // OTA: a new image is on probation until the first successful gateway check; a health-driven
 // reboot while on probation rolls back to the previous image instead.
 //
-// Default build is low power: automatic light sleep + Wi-Fi power save. The CPU sleeps whenever
-// idle and is woken by interrupts (radio traffic, timers). With CONFIG_APP_CSI_MOTION the radio
-// stays on instead and the CSI motion sensor (/motion, /api/motion) is built in.
+// Low power by default: automatic light sleep + Wi-Fi power save. The CPU sleeps whenever idle and
+// is woken by interrupts (radio traffic, timers). With the CSI motion sensor switched on in the
+// settings (/motion, /api/motion), the radio stays on and light sleep is off instead.
 // No credentials are compiled in. Wi-Fi settings and the admin password live in NVS and are set
 // on the setup page: an unconfigured device opens the WPA3 setup AP "ESP32-Setup-XXXX" (see
 // provision.h), and the same AP comes back if the stored network stays unreachable for
@@ -71,20 +71,12 @@
 #include "sdkconfig.h"
 #include "settings.h"
 
-#if CONFIG_APP_CSI_MOTION
 #include "motion.h"
-#endif
 
-// On-board LED: slow blink = connecting. Low-power build: off when idle, short flash per HTTP
-// request. Motion build: solid when connected, fast blink on motion.
+// On-board LED: see led_task for the modes.
 #define LED_GPIO       GPIO_NUM_2
 #define BUTTON_GPIO    GPIO_NUM_0   // BOOT button, active low (external pull-up on the board)
 #define BUTTON_RESET_S 20
-#if CONFIG_APP_CSI_MOTION
-#define POWER_SAVE_JSON "false"
-#else
-#define POWER_SAVE_JSON "true"
-#endif
 #define RETRY_MIN_MS   2000
 #define RETRY_MAX_MS   60000
 
@@ -93,6 +85,16 @@
 #define FALLBACK_AP_S         120  // Wi-Fi down this long -> also open the setup AP
 #define NET_TEST_S            30   // new network options must reach the gateway within this
 #define NTP_SERVER            "pool.ntp.org"
+
+// Automatic TX power: the link is roughly symmetric, so the router hears us about as much weaker
+// than it transmits as we hear it. Aim for the router to receive us at TX_AUTO_TARGET_DBM (a solid
+// margin over the ~-82 dBm a 2.4 GHz link needs for its low rates), assuming the router sends at
+// TX_AUTO_AP_DBM. A failed gateway check adds TX_AUTO_STEP_DB of margin for the rest of the run.
+#define TX_AUTO_AP_DBM        20
+#define TX_AUTO_TARGET_DBM    (-67)
+#define TX_AUTO_MIN_DBM       2
+#define TX_AUTO_STEP_DB       3
+#define TX_AUTO_MAX_MARGIN_DB 12
 
 #define CONNECTED_BIT     BIT0
 #define DISCONNECTED_BIT  BIT1
@@ -119,6 +121,8 @@ static uint32_t s_gw_rtt_ms;
 static int64_t s_gw_last_check_us;
 static uint32_t s_act_reconnects, s_act_wifi_restarts, s_act_net_reverts;
 static bool s_sntp_started;
+static int s_tx_now;          // TX power limit currently set (dBm)
+static int s_tx_auto_margin;  // extra dB learned from failures (automatic TX power)
 static bool s_time_synced;
 
 // ---------- Wi-Fi ----------
@@ -175,6 +179,57 @@ static void resume_sta(void)
 }
 
 static void wifi_apply_ps(void);
+
+// ---------- TX power ----------
+
+static void tx_set(int dbm, const char *why)
+{
+    s_tx_now = dbm;
+    esp_wifi_set_max_tx_power(dbm * 4);  // unit 0.25 dBm; the chip rounds to its power steps
+    if (why) {
+        ESP_LOGI(TAG, "TX power: %d dBm (%s)", dbm, why);
+    }
+}
+
+// Automatic TX power: called after each successful gateway check.
+static void tx_autotune(void)
+{
+    if (!settings_tx_auto()) {
+        return;
+    }
+    int sum = 0, n = 0;
+    for (int i = 0; i < 5; i++) {  // smooth out RSSI jitter
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            sum += ap.rssi;
+            n++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if (!n) {
+        return;
+    }
+    int rssi = sum / n;
+    int want = TX_AUTO_AP_DBM + TX_AUTO_TARGET_DBM - rssi + s_tx_auto_margin;
+    want = want < TX_AUTO_MIN_DBM ? TX_AUTO_MIN_DBM : want > CONFIG_ESP_PHY_MAX_WIFI_TX_POWER ? CONFIG_ESP_PHY_MAX_WIFI_TX_POWER : want;
+    // Up at once; down only in steps of 2 dB or more, so RSSI noise doesn't cause constant changes.
+    if (want > s_tx_now || want <= s_tx_now - 2) {
+        char why[48];
+        snprintf(why, sizeof(why), "auto, RSSI %d dBm, margin +%d dB", rssi, s_tx_auto_margin);
+        tx_set(want, why);
+    }
+}
+
+// Automatic TX power: the gateway didn't answer. Back to full power and keep more margin.
+static void tx_auto_failed(void)
+{
+    if (settings_tx_auto() && s_tx_now < CONFIG_ESP_PHY_MAX_WIFI_TX_POWER) {
+        if (s_tx_auto_margin < TX_AUTO_MAX_MARGIN_DB) {
+            s_tx_auto_margin += TX_AUTO_STEP_DB;
+        }
+        tx_set(CONFIG_ESP_PHY_MAX_WIFI_TX_POWER, "auto: gateway check failed, more margin from now on");
+    }
+}
 static void net_apply_ip(void);
 static void net_apply_dns(void);
 
@@ -226,11 +281,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         return;  // belongs to a setup attempt
     }
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_set_max_tx_power(settings_tx_dbm() * 4);  // unit 0.25 dBm; reset by a driver restart
+        tx_set(settings_tx_dbm(), NULL);  // reset by a driver restart; automatic mode starts at full
         start_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *ev = data;
         mark_down();
+        motion_on_disconnected();
+        if (settings_tx_auto() && s_tx_now < CONFIG_ESP_PHY_MAX_WIFI_TX_POWER) {
+            tx_set(CONFIG_ESP_PHY_MAX_WIFI_TX_POWER, "reconnect at full power");
+        }
         if (!settings_have_wifi()) {
             return;  // unconfigured: nothing to retry
         }
@@ -268,9 +327,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             s_sntp_started = true;
             sntp_start();
         }
-#if CONFIG_APP_CSI_MOTION
         motion_on_connected(ev->ip_info.gw);
-#endif
     }
 }
 
@@ -279,12 +336,12 @@ static void wifi_apply_ps(void)
     if (prov_ap_active()) {
         return;  // the setup AP needs the radio on
     }
-#if CONFIG_APP_CSI_MOTION
-    esp_wifi_set_ps(WIFI_PS_NONE);  // keep the receiver on: CSI needs every frame
-#else
-    // Radio sleeps between beacons; the AP buffers our packets and flags them in its beacon.
-    esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
-#endif
+    if (settings()->motion) {
+        esp_wifi_set_ps(WIFI_PS_NONE);  // keep the receiver on: CSI needs every frame
+    } else {
+        // Radio sleeps between beacons; the AP buffers our packets and flags them in its beacon.
+        esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+    }
 }
 
 static void wifi_init(void)
@@ -433,7 +490,7 @@ static void net_apply_ip(void)
 // Push all network options from settings() to the driver and netif. Call while disconnected.
 static void net_apply(void)
 {
-    esp_wifi_set_max_tx_power(settings_tx_dbm() * 4);
+    tx_set(settings_tx_dbm(), NULL);
     if (settings_have_wifi()) {
         prov_set_sta(settings()->ssid, settings()->pass);  // carries the listen interval
     }
@@ -453,7 +510,7 @@ static void net_reconnect(void)
 
 static bool net_custom(void)
 {
-    return settings()->ip || settings()->tx_dbm;
+    return settings()->ip || (settings()->tx_dbm && !settings_tx_auto());  // auto protects itself
 }
 
 // Network unreachable with custom options: go back to DHCP and full power, persistently.
@@ -478,7 +535,9 @@ static void net_test_task(void *arg)
     settings_t prev = *settings();
     vTaskDelay(pdMS_TO_TICKS(300));  // let the HTTP reply out before the link drops
     settings_set_options(&s_nt_next);
-    ESP_LOGW(TAG, "Net: trying TX %d dBm, listen interval %d, %s", settings_tx_dbm(), settings_listen(),
+    s_tx_auto_margin = 0;
+    ESP_LOGW(TAG, "Net: trying TX %s%d dBm, listen interval %d, %s", settings_tx_auto() ? "auto from " : "",
+             settings_tx_dbm(), settings_listen(),
              settings()->ip ? "static IP" : "DHCP");
     net_reconnect();
 
@@ -501,7 +560,9 @@ static void net_test_task(void *arg)
     } else {
         wifi_ap_record_t ap;
         int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
-        snprintf(s_nt_msg, sizeof(s_nt_msg), "connected (RSSI %d dBm, gateway %" PRIu32 " ms): saved", rssi, rtt);
+        tx_autotune();
+        snprintf(s_nt_msg, sizeof(s_nt_msg), "connected (RSSI %d dBm, gateway %" PRIu32 " ms, TX %d dBm): saved",
+                 rssi, rtt, s_tx_now);
         ESP_LOGI(TAG, "Net: new options work, %s", s_nt_msg);
         s_nt = NT_OK;
     }
@@ -595,11 +656,13 @@ static void health_task(void *arg)
             s_gw_fails = 0;
             s_gw_rtt_ms = rtt;
             ota_confirm();  // new firmware proved it can reach the network
+            tx_autotune();
             continue;
         }
 
         s_gw_ok = false;
         s_gw_fails++;
+        tx_auto_failed();
         ESP_LOGW(TAG, "Health: gateway " IPSTR " not answering (failure %" PRIu32 ")", IP2STR(&s_gw), s_gw_fails);
         switch (s_gw_fails) {
         case 1:
@@ -638,18 +701,32 @@ static const char *reset_reason_str(void)
     }
 }
 
+// Light sleep unless the motion sensor runs (it needs the CPU and radio awake).
 static void power_init(void)
 {
     esp_pm_config_t pm = {
         .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
         .min_freq_mhz = 40,  // XTAL frequency when nothing holds a PM lock
-#if CONFIG_APP_CSI_MOTION
-        .light_sleep_enable = false,
-#else
-        .light_sleep_enable = true,
-#endif
+        .light_sleep_enable = !settings()->motion,
     };
     ESP_ERROR_CHECK(esp_pm_configure(&pm));
+}
+
+void app_apply_motion(void)
+{
+    bool on = settings()->motion;
+    if (on) {
+        power_init();  // awake first, then start sensing
+        wifi_apply_ps();
+        motion_enable(true);
+    } else {
+        motion_enable(false);
+        power_init();
+        wifi_apply_ps();
+    }
+    app_led_changed();
+    ESP_LOGI(TAG, "Motion sensor %s: %s", on ? "on" : "off",
+             on ? "radio always on, no light sleep" : "light sleep + Wi-Fi power save");
 }
 
 static void led_off_cb(void *arg)
@@ -657,20 +734,21 @@ static void led_off_cb(void *arg)
     gpio_set_level(LED_GPIO, 0);
 }
 
-// Brief LED flash for an HTTP request (low-power build only; uses no task, just a one-shot timer).
+// Brief LED flash for an HTTP request (activity mode without the motion sensor; uses no task, just
+// a one-shot timer).
 static void led_flash(void)
 {
-#if !CONFIG_APP_CSI_MOTION
-    if (settings()->led == LED_ACTIVITY && (xEventGroupGetBits(s_wifi_events) & CONNECTED_BIT)) {
+    if (settings()->led == LED_ACTIVITY && !settings()->motion &&
+        (xEventGroupGetBits(s_wifi_events) & CONNECTED_BIT)) {
         gpio_set_level(LED_GPIO, 1);
         esp_timer_stop(s_led_off_timer);
         esp_timer_start_once(s_led_off_timer, 30 * 1000);
     }
-#endif
 }
 
-// LED modes (settings()->led): off; activity (default: blink while connecting, flash per request,
-// motion build: solid when connected, fast blink on motion); connected (solid while connected).
+// LED modes (settings()->led): off; activity (default: blink while connecting, flash per request;
+// with the motion sensor on: solid when connected, fast blink on motion); connected (solid while
+// connected).
 // The BOOT button countdown drives the LED itself in every mode.
 static void led_task(void *arg)
 {
@@ -689,20 +767,14 @@ static void led_task(void *arg)
         }
         if (!up) {
             level = (tick / 4) % 2;
-#if CONFIG_APP_CSI_MOTION
-        } else if (motion_active()) {
-            level = !level;
-        } else {
-            level = 1;
-        }
-#else
+        } else if (settings()->motion) {
+            level = motion_active() ? !level : 1;
         } else {
             // Activity mode, connected and idle: LED off until disconnected or the mode changes.
             gpio_set_level(LED_GPIO, 0);
             xEventGroupWaitBits(s_wifi_events, DISCONNECTED_BIT | LED_KICK_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
             continue;
         }
-#endif
         gpio_set_level(LED_GPIO, level);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -859,18 +931,18 @@ static esp_err_t status_get(httpd_req_t *req)
     }
     snprintf(body, 1536,
              "{\"hostname\":\"%s\",\"ssid\":%s,\"connected\":%s,\"setup_ap\":%s,\"ip\":%s%s%s,"
-             "\"ip_mode\":\"%s\",\"dns\":\"%s\",\"rssi_dbm\":%s,\"tx_power_dbm\":%.1f,\"time\":%s,"
+             "\"ip_mode\":\"%s\",\"dns\":\"%s\",\"rssi_dbm\":%s,\"tx_power_dbm\":%.1f,\"tx_auto\":%s,\"time\":%s,"
              "\"uptime_s\":%lld,\"reset_reason\":\"%s\",\"wifi_connects\":%" PRIu32 ","
              "\"http_requests\":%" PRIu32 ",\"free_heap\":%" PRIu32 ",\"min_free_heap\":%" PRIu32 ","
-             "\"power_save\":%s,\"gateway_ok\":%s,\"gateway_rtt_ms\":%" PRIu32 ","
+             "\"motion\":%s,\"power_save\":%s,\"gateway_ok\":%s,\"gateway_rtt_ms\":%" PRIu32 ","
              "\"gateway_fails\":%" PRIu32 ",\"gateway_checked_s_ago\":%lld,"
              "\"recovery_reconnects\":%" PRIu32 ",\"recovery_wifi_restarts\":%" PRIu32 ","
              "\"recovery_net_reverts\":%" PRIu32 ",\"update_available\":%s%s%s,%s,%s}",
              settings_hostname(), ssid, up ? "true" : "false", prov_ap_active() ? "true" : "false",
              up ? "\"" : "", ip, up ? "\"" : "", settings()->ip ? "static" : "dhcp", dns,
-             rssi, tx / 4.0, now, esp_timer_get_time() / 1000000, reset_reason_str(), s_connects, s_requests,
+             rssi, tx / 4.0, settings_tx_auto() ? "true" : "false", now, esp_timer_get_time() / 1000000, reset_reason_str(), s_connects, s_requests,
              esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
-             POWER_SAVE_JSON, s_gw_checked ? (s_gw_ok ? "true" : "false") : "null", s_gw_rtt_ms,
+             settings()->motion ? "true" : "false", settings()->motion ? "false" : "true", s_gw_checked ? (s_gw_ok ? "true" : "false") : "null", s_gw_rtt_ms,
              s_gw_fails, s_gw_checked ? (esp_timer_get_time() - s_gw_last_check_us) / 1000000 : -1LL,
              s_act_reconnects, s_act_wifi_restarts, s_act_net_reverts,
              avail ? "\"" : "", avail ? avail : "null", avail ? "\"" : "", ota, s_device_json);
@@ -920,7 +992,6 @@ static esp_err_t wakes_get(httpd_req_t *req)
     return err;
 }
 
-#if CONFIG_APP_CSI_MOTION
 extern const char motion_html_start[] asm("_binary_motion_html_start");
 extern const char motion_html_end[] asm("_binary_motion_html_end");
 
@@ -929,7 +1000,7 @@ static esp_err_t motion_page_get(httpd_req_t *req)
     s_requests++;
     led_flash();
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    return httpd_resp_send(req, motion_html_start, motion_html_end - motion_html_start);
+    return httpd_resp_send(req, motion_html_start, motion_html_end - motion_html_start - 1);  // no NUL
 }
 
 // GET /api/motion[?sens=2.5]
@@ -948,14 +1019,13 @@ static esp_err_t motion_get_api(httpd_req_t *req)
     int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
     char body[256];
     snprintf(body, sizeof(body),
-             "{\"motion\":%s,\"score\":%.3f,\"baseline\":%.3f,\"sens\":%.2f,\"csi_rate\":%" PRIu32 ","
+             "{\"enabled\":%s,\"motion\":%s,\"score\":%.3f,\"baseline\":%.3f,\"sens\":%.2f,\"csi_rate\":%" PRIu32 ","
              "\"events\":%" PRIu32 ",\"last_motion_s_ago\":%lld,\"rssi_dbm\":%d}",
-             m.motion ? "true" : "false", m.score, m.baseline, m.sens, m.csi_rate, m.events,
+             motion_enabled() ? "true" : "false", m.motion ? "true" : "false", m.score, m.baseline, m.sens, m.csi_rate, m.events,
              m.last_motion_s_ago, rssi);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
 }
-#endif
 
 static void http_start(void)
 {
@@ -975,12 +1045,10 @@ static void http_start(void)
     ota_register(server);
     prov_register(server);
     update_register(server);
-#if CONFIG_APP_CSI_MOTION
     const httpd_uri_t mpage = { .uri = "/motion", .method = HTTP_GET, .handler = motion_page_get };
     const httpd_uri_t mapi = { .uri = "/api/motion", .method = HTTP_GET, .handler = motion_get_api };
     httpd_register_uri_handler(server, &mpage);
     httpd_register_uri_handler(server, &mapi);
-#endif
     ESP_LOGI(TAG, "HTTP: listening on port %d", cfg.server_port);
 }
 
@@ -1007,8 +1075,10 @@ void app_main(void)
     device_info_init();
     s_ping_done = xSemaphoreCreateBinary();
     s_ping_lock = xSemaphoreCreateMutex();
+    motion_init();
     power_init();
     wifi_init();
+    motion_enable(settings()->motion);  // starts sensing once connected
     led_init();
     button_init();
     update_init();

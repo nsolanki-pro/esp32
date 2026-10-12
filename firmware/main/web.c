@@ -17,12 +17,6 @@
 #include "settings.h"
 #include "update.h"
 
-#if CONFIG_APP_CSI_MOTION
-#define VARIANT "motion"
-#else
-#define VARIANT "default"
-#endif
-
 static const char *TAG = "web";
 
 // ---------- static files ----------
@@ -81,17 +75,12 @@ static esp_err_t config_get(httpd_req_t *req)
     ip_str(s->dns, dns);
     snprintf(body, sizeof(body),
              "{\"hostname\":\"%s\",\"tz\":%s,\"led\":%d,\"auto_check\":%s,\"health_s\":%u,"
-             "\"listen\":%d,\"tx_dbm\":%d,\"ip\":\"%s\",\"mask\":\"%s\",\"gw\":\"%s\",\"dns\":\"%s\","
+             "\"motion\":%s,\"listen\":%d,\"tx_dbm\":%d,\"tx_auto\":%s,\"ip\":\"%s\",\"mask\":\"%s\",\"gw\":\"%s\",\"dns\":\"%s\","
              "\"defaults\":{\"hostname\":\"%s\",\"health_s\":%d,\"listen\":%d,\"tx_dbm\":%d},"
-             "\"variant\":\"%s\",\"power_save\":%s,\"update_repo\":\"%s\"}",
+             "\"update_repo\":\"%s\"}",
              settings_hostname(), tz, s->led, s->auto_check ? "true" : "false", (unsigned)settings_health_s(),
-             settings_listen(), settings_tx_dbm(), ip, mask, gw, dns, SETTINGS_DEFAULT_HOSTNAME,
-             CONFIG_APP_HEALTH_INTERVAL_S,
-#if CONFIG_APP_CSI_MOTION
-             0, CONFIG_ESP_PHY_MAX_WIFI_TX_POWER, VARIANT, "false",
-#else
-             CONFIG_APP_LISTEN_INTERVAL, CONFIG_ESP_PHY_MAX_WIFI_TX_POWER, VARIANT, "true",
-#endif
+             s->motion ? "true" : "false", settings_listen(), settings_tx_dbm(), settings_tx_auto() ? "true" : "false", ip, mask, gw, dns, SETTINGS_DEFAULT_HOSTNAME,
+             CONFIG_APP_HEALTH_INTERVAL_S, CONFIG_APP_LISTEN_INTERVAL, CONFIG_ESP_PHY_MAX_WIFI_TX_POWER,
              CONFIG_APP_UPDATE_REPO);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -165,7 +154,7 @@ static esp_err_t config_post(httpd_req_t *req)
     settings_t next = *settings();
     char host[40], tz[sizeof(next.tz) + 1];
     bool has_host, has_tz;
-    long led = next.led, autochk = next.auto_check, health = next.health_s;
+    long led = next.led, autochk = next.auto_check, health = next.health_s, motion = next.motion;
     const char *err = NULL;
     if (!http_form_field(body, "hostname", host, sizeof(host), &has_host) || (has_host && host[0] && !valid_hostname(host))) {
         err = "hostname: 1-32 letters, digits or hyphens (not first or last)\n";
@@ -175,6 +164,8 @@ static esp_err_t config_post(httpd_req_t *req)
         err = "led: 0, 1 or 2\n";
     } else if (!int_field(body, "auto_check", 0, 1, true, &autochk)) {
         err = "auto_check: 0 or 1\n";
+    } else if (!int_field(body, "motion", 0, 1, true, &motion)) {
+        err = "motion: 0 or 1\n";
     } else if (!int_field(body, "health_s", 30, 3600, true, &health)) {
         err = "health check interval: 30-3600 s (empty for the default)\n";
     }
@@ -191,12 +182,14 @@ static esp_err_t config_post(httpd_req_t *req)
     next.led = led;
     next.auto_check = autochk;
     next.health_s = health;
+    next.motion = motion;
 
     const settings_t *cur = settings();
     bool host_changed = strcmp(next.hostname, cur->hostname) != 0;
     bool tz_changed = strcmp(next.tz, cur->tz) != 0;
     bool led_changed = next.led != cur->led;
     bool auto_changed = next.auto_check != cur->auto_check;
+    bool motion_changed = next.motion != cur->motion;
     settings_set_options(&next);
     if (settings_save_options() != ESP_OK) {
         return http_send_text(req, "500 Internal Server Error", "could not save\n");
@@ -212,6 +205,9 @@ static esp_err_t config_post(httpd_req_t *req)
     }
     if (auto_changed) {
         update_set_auto(next.auto_check);
+    }
+    if (motion_changed) {
+        app_apply_motion();
     }
     ESP_LOGI(TAG, "options saved");
     return http_send_text(req, "200 OK", "saved\n");
@@ -256,10 +252,12 @@ static esp_err_t net_post(httpd_req_t *req)
     long listen = next.listen, tx = next.tx_dbm;
     uint32_t ip, mask, gw, dns;
     const char *err = NULL;
+    char txs[8];
+    bool tx_auto = http_form_field(body, "tx_dbm", txs, sizeof(txs), NULL) && strcmp(txs, "auto") == 0;
     if (!int_field(body, "listen", 1, 10, true, &listen)) {
         err = "listen interval: 1-10 beacons (empty for the default)\n";
-    } else if (!int_field(body, "tx_dbm", 2, 20, true, &tx)) {
-        err = "TX power: 2-20 dBm (empty for the default)\n";
+    } else if (!tx_auto && !int_field(body, "tx_dbm", 2, 20, true, &tx)) {
+        err = "TX power: 2-20 dBm, or auto (empty for the default)\n";
     } else if (!ip_field(body, "ip", &ip) || !ip_field(body, "mask", &mask) || !ip_field(body, "gw", &gw) ||
                !ip_field(body, "dns", &dns)) {
         err = "IP addresses must look like 192.168.1.50\n";
@@ -281,7 +279,7 @@ static esp_err_t net_post(httpd_req_t *req)
         }
     }
     next.listen = listen;
-    next.tx_dbm = tx == CONFIG_ESP_PHY_MAX_WIFI_TX_POWER ? 0 : tx;  // full power = the default
+    next.tx_dbm = tx_auto ? SETTINGS_TX_AUTO : tx == CONFIG_ESP_PHY_MAX_WIFI_TX_POWER ? 0 : tx;  // full = default
     next.ip = ip;
     next.mask = ip ? mask : 0;
     next.gw = ip ? gw : 0;

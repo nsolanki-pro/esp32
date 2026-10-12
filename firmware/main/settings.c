@@ -41,6 +41,9 @@ void settings_load(void)
     uint8_t b = 0;
     nvs_get_u8(h, "autochk", &b);
     s_set.auto_check = b;
+    b = 0;
+    nvs_get_u8(h, "motion", &b);
+    s_set.motion = b;
     nvs_get_u16(h, "health", &s_set.health_s);
     nvs_get_u8(h, "listen", &s_set.listen);
     nvs_get_u8(h, "txdbm", &s_set.tx_dbm);
@@ -69,16 +72,17 @@ uint32_t settings_health_s(void)
 
 int settings_listen(void)
 {
-#if CONFIG_APP_CSI_MOTION
-    return 0;  // power save is off in the motion build
-#else
     return s_set.listen ? s_set.listen : CONFIG_APP_LISTEN_INTERVAL;
-#endif
 }
 
 int settings_tx_dbm(void)
 {
-    return s_set.tx_dbm ? s_set.tx_dbm : CONFIG_ESP_PHY_MAX_WIFI_TX_POWER;
+    return s_set.tx_dbm && s_set.tx_dbm != SETTINGS_TX_AUTO ? s_set.tx_dbm : CONFIG_ESP_PHY_MAX_WIFI_TX_POWER;
+}
+
+bool settings_tx_auto(void)
+{
+    return s_set.tx_dbm == SETTINGS_TX_AUTO;
 }
 
 void settings_set_options(const settings_t *opt)
@@ -88,6 +92,7 @@ void settings_set_options(const settings_t *opt)
     s_set.led = opt->led;
     s_set.auto_check = opt->auto_check;
     s_set.health_s = opt->health_s;
+    s_set.motion = opt->motion;
     s_set.listen = opt->listen;
     s_set.tx_dbm = opt->tx_dbm;
     s_set.ip = opt->ip;
@@ -106,6 +111,7 @@ esp_err_t settings_save_options(void)
     esp_err_t e[] = {
         nvs_set_str(h, "host", s_set.hostname), nvs_set_str(h, "tz", s_set.tz),
         nvs_set_u8(h, "led", s_set.led), nvs_set_u8(h, "autochk", s_set.auto_check),
+        nvs_set_u8(h, "motion", s_set.motion),
         nvs_set_u16(h, "health", s_set.health_s), nvs_set_u8(h, "listen", s_set.listen),
         nvs_set_u8(h, "txdbm", s_set.tx_dbm), nvs_set_u32(h, "ip", s_set.ip),
         nvs_set_u32(h, "mask", s_set.mask), nvs_set_u32(h, "gw", s_set.gw), nvs_set_u32(h, "dns", s_set.dns),

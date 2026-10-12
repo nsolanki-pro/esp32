@@ -12,10 +12,12 @@ are set on the device.
 - **OTA updates** from the browser or a script; a new image must prove it can reach the network or
   the bootloader rolls back to the previous one
 - **Factory reset** from the web UI or by holding BOOT for 20 s
-- **Web settings**: hostname, time zone (NTP clock), LED mode, static IP, Wi-Fi TX power and power
+- **Web settings**: hostname, time zone (NTP clock), LED mode, static IP, Wi-Fi TX power (fixed or
+  automatic) and power
   save, reboot, switch between the two firmware slots, live log viewer; network changes are tested
   and undone automatically if the device loses the network
-- Optional **CSI motion sensor** build (Wi-Fi channel state information, no extra hardware)
+- Optional **CSI motion sensor** (Wi-Fi channel state information, no extra hardware), switched on
+  and off in the settings
 
 ## Quick start (prebuilt release)
 
@@ -58,7 +60,8 @@ comes back alongside normal reconnect attempts. Changing Wi-Fi from there needs 
 |---|---|
 | `/` | Status: network, gateway health, time, uptime, last reset reason, memory, firmware, chip/flash/MAC |
 | `/logs` | Live log: the last 8 KB of the device log, no USB cable needed (`/api/logs?from=N`) |
-| `/update` | Install the latest release or switch build variant, boot the other app slot, upload a file |
+| `/update` | Install the latest release, boot the other app slot, upload a file |
+| `/motion` | Motion sensor: live score graph and sensitivity (when switched on) |
 | `/settings` | Device and network options, admin password, reboot, factory reset |
 | `/setup` | Change Wi-Fi network (admin password once set) |
 | `/api/power` | Time spent active / idle / in light sleep |
@@ -78,12 +81,20 @@ A status banner appears when a newer release is known.
 | LED | *Activity* (default: blink while connecting, flash per request), *On while connected*, or *Off*. The BOOT-button countdown always uses the LED |
 | Gateway check | Health-check interval, 30-3600 s (default 300) |
 | Daily update check | Off by default. Checks GitHub once a day and shows a banner; it never installs by itself |
+| Wi-Fi motion sensor | Off by default. Detects movement from changes in the Wi-Fi channel (`/motion`). While on, the board pings the gateway 50×/s and keeps the radio and CPU awake: roughly 100 mA instead of a few mA. Turning it off restores light sleep and power save at once |
 
 **Network** (*Apply and test*): DHCP or static IP (IP, netmask, gateway, DNS; an empty DNS keeps the
-server in use now), Wi-Fi TX power (2-20 dBm; the chip rounds to its nearest power step), and the
-power-save listen interval. Applying reconnects Wi-Fi and pings the gateway. If that doesn't work within
+server in use now), Wi-Fi TX power, and the power-save listen interval.
+
+TX power is either fixed (2-20 dBm; the chip rounds to its nearest power step; default 20) or
+**Auto**. Auto connects at full power, then sets the lowest power the router should still hear well:
+it measures the router's signal, assumes the router transmits at about 20 dBm and the link is
+symmetric, and aims for the router to receive the board at -67 dBm. It re-tunes after every successful
+gateway check (going up at once, down only in steps of 2 dB or more). A failed gateway check sends it
+back to full power with 3 dB more margin from then on, and every reconnect starts at full power.
+Example: at -57 dBm from the router it settles at about 10 dBm. Applying reconnects Wi-Fi and pings the gateway. If that doesn't work within
 30 s, the previous settings are restored by themselves and the page says why. As a second safety net,
-if the network later stays unreachable with a static IP or reduced TX power (Wi-Fi down 2 min, or the
+if the network later stays unreachable with a static IP or a fixed reduced TX power (Wi-Fi down 2 min, or the
 gateway fails three checks), the device goes back to DHCP and full power on its own and logs it.
 
 API: `GET/POST /api/config`, `GET/POST /api/net` (POST returns at once; poll GET for
@@ -108,10 +119,9 @@ The repository is a build option (`idf.py menuconfig` → *App* → *GitHub repo
 updates*, empty disables it). API: `GET /api/update`, `POST /api/update/check`,
 `POST /api/update/install` (admin password).
 
-**Switching build variant:** every release has a default (low power) and a motion (CSI sensor) image,
-listed in its `manifest.json`. `/update` offers *Switch to the motion build* (or back); the switch
-works at any version, so it also lets you go to the other variant of the same release. API:
-`POST /api/update/install?variant=motion`.
+Up to v1.2.0 the motion sensor was a separate build. Releases now contain one image and list it in
+`manifest.json` under both names, so boards running an old motion build update to it as usual; switch
+the sensor on again in *Settings* afterwards.
 
 **Other app slot:** the board keeps the previous firmware in its second slot. `/update` lists both
 slots (version, build date, state) and *Boot …* switches to the other one. The switched-to image runs on
@@ -157,25 +167,18 @@ Requires [ESP-IDF v6.0.3](https://docs.espressif.com/projects/esp-idf/en/v6.0.3/
 
 ```sh
 cd firmware
-idf.py build                                  # low-power build
+idf.py build
 idf.py -p /dev/ttyUSB0 -b 115200 flash        # first install over USB
 ```
 
 The first USB flash installs the bootloader and the two-slot partition table; after that, use OTA.
 
-**CSI motion sensor variant** (radio always on, no light sleep; adds `/motion` and `/api/motion`):
-
-```sh
-idf.py -B build-motion -D SDKCONFIG=build-motion/sdkconfig \
-       -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.motion" build
-```
-
-**Options** (`idf.py menuconfig` → *App*): Wi-Fi listen interval, health-check interval, how long
-Wi-Fi may stay down before a reboot, CSI motion build.
+**Options** (`idf.py menuconfig` → *App*): default Wi-Fi listen interval and health-check interval,
+how long Wi-Fi may stay down before a reboot, GitHub repository for updates.
 
 ## Releases
 
-Pushing a tag builds both variants on GitHub Actions and publishes a release:
+Pushing a tag builds the firmware on GitHub Actions and publishes a release:
 
 ```sh
 git tag v1.1.0 && git push origin v1.1.0
@@ -185,7 +188,6 @@ git tag v1.1.0 && git push origin v1.1.0
 |---|---|
 | `esp32-<version>-ota.bin` | OTA update (`/update` or `ota.sh`) |
 | `esp32-<version>-full.bin` | USB flash at offset `0x0` (new or erased board) |
-| `esp32-<version>-motion-*` | Same, CSI motion variant |
 | `SHA256SUMS` | Checksums |
 | `manifest.json` | Version, file names and SHA-256 that the device reads for one-click updates |
 

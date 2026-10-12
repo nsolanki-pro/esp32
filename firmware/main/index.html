@@ -31,7 +31,7 @@ async function refresh() {
     ['IP address', s.ip ? `${s.ip} (${s.ip_mode === 'static' ? 'static' : 'DHCP'})` : null],
     ['DNS server', s.dns || undefined],
     ['signal', s.rssi_dbm !== null ? `${s.rssi_dbm} dBm` : null],
-    ['TX power', `${s.tx_power_dbm} dBm max`],
+    ['TX power', `${s.tx_power_dbm} dBm max${s.tx_auto ? ' (auto)' : ''}`],
     ['setup network', s.setup_ap ? 'open (fallback)' : undefined],
   ]);
   rows($('health'), [
@@ -47,6 +47,7 @@ async function refresh() {
     ['running from', s.partition + (s.ota_pending ? ', on probation' : '')],
     ['last rollback', s.rolled_back_from],
     ['free memory', `${Math.round(s.free_heap / 1024)} KB (lowest ${Math.round(s.min_free_heap / 1024)} KB)`],
+    ['motion sensor', s.motion ? 'on (radio always on)' : 'off'],
     ['power save', yes(s.power_save)],
     ['HTTP requests', s.http_requests],
   ]);
@@ -54,7 +55,8 @@ async function refresh() {
   const b = $('banner');
   b.hidden = !s.update_available;
   if (s.update_available) b.innerHTML = `Update available: <b></b> · <a href="/update">install</a>`, b.querySelector('b').textContent = s.update_available;
-  if (!s.power_save) $('links').innerHTML = '<a href="/api/status">JSON</a>';
+  $('links').innerHTML = '<a href="/api/status">JSON</a> · <a href="/api/power">power stats</a> · ' +
+    (s.motion ? '<a href="/motion">motion sensor</a>' : '<a href="/api/wakes">what wakes the radio</a>');
 }
 refresh();
 setInterval(refresh, 3000);

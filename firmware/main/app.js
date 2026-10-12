@@ -37,7 +37,7 @@ function duration(s) {
   try {
     const c = await getJSON('/api/config');
     $('nav-host').textContent = c.hostname;
-    if (c.variant === 'motion') add(['/motion', 'Motion']);
+    if (c.motion) add(['/motion', 'Motion']);
   } catch (e) {}
 })();
 

@@ -30,11 +30,7 @@
 #define AUTO_FIRST_S  120             // daily check: first one this long after boot / enabling
 #define AUTO_PERIOD_S (24 * 3600)
 
-#if CONFIG_APP_CSI_MOTION
-#define VARIANT "motion"
-#else
-#define VARIANT "default"
-#endif
+#define VARIANT "default"  // the only build; releases also list it as "motion" for older devices
 
 static const char *TAG = "update";
 

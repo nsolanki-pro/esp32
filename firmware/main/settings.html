@@ -32,6 +32,9 @@
   </select>
   <label for="health_s">Gateway check every (seconds) <span class="hint">30-3600</span></label>
   <input id="health_s" type="number" min="30" max="3600">
+  <label class="inline" style="display:block;margin-top:1em"><input id="motion" type="checkbox"> Wi-Fi motion sensor
+    <span class="hint">(detects movement from Wi-Fi signal changes, see <a href="/motion">/motion</a>. Keeps the radio and
+    CPU awake: roughly 100 mA instead of a few mA)</span></label>
   <label class="inline" style="display:block;margin-top:1em"><input id="auto_check" type="checkbox"> Check GitHub for new firmware once a day <span class="hint">(only reports; never installs by itself)</span></label>
   <button type="submit">Save</button>
 </form>
@@ -54,11 +57,13 @@
     </div>
   </div>
   <div class="row">
-    <div id="listen-w"><label for="listen">Power save: wake every N beacons</label><select id="listen"></select></div>
+    <div id="listen-w"><label for="listen">Power save: wake every N beacons <span class="hint">(unused while the motion sensor runs)</span></label><select id="listen"></select></div>
     <div><label for="tx_dbm">Max TX power</label><select id="tx_dbm"></select></div>
   </div>
   <p class="hint">Applying reconnects Wi-Fi and checks the gateway. If that fails within 30 s, the previous
-  settings come back by themselves. Lower TX power saves energy when the router is close.</p>
+  settings come back by themselves. Lower TX power saves energy when the router is close. <i>Auto</i> starts at
+  full power, then lowers it to what the signal strength says the router needs, plus a margin; it goes back
+  to full power by itself if the gateway stops answering.</p>
   <button type="submit">Apply and test</button>
 </form>
 <p id="net-msg" class="msg"></p>
@@ -123,18 +128,19 @@ async function load() {
   $('led').value = c.led;
   $('health_s').value = c.health_s;
   $('auto_check').checked = c.auto_check;
+  $('motion').checked = c.motion;
   if (!c.update_repo) $('auto_check').disabled = true;
   fillSelect($('listen'), [...Array(10)].map((_, i) => [`${i + 1} (${(i + 1) * 102} ms)${i + 1 === c.defaults.listen ? ', default' : ''}`, i + 1]));
-  fillSelect($('tx_dbm'), [20, 17, 15, 13, 11, 8, 5, 2].map(d => [`${d} dBm${d === c.defaults.tx_dbm ? ' (default, full)' : ''}`, d]));
-  $('listen').value = c.listen; $('tx_dbm').value = c.tx_dbm;
-  $('listen-w').hidden = !c.power_save;
+  fillSelect($('tx_dbm'), [['Auto: lowest that reaches the router', 'auto'],
+    ...[20, 17, 15, 13, 11, 8, 5, 2].map(d => [`${d} dBm${d === c.defaults.tx_dbm ? ' (default, full)' : ''}`, d])]);
+  $('listen').value = c.listen; $('tx_dbm').value = c.tx_auto ? 'auto' : c.tx_dbm;
   document.querySelector(`[name=ipmode][value=${c.ip ? 'static' : 'dhcp'}]`).checked = true;
   for (const k of ['ip', 'mask', 'gw', 'dns']) $(k).value = c[k];
   if (!c.ip && s.ip) { $('ip').placeholder = s.ip; $('dns').placeholder = s.dns; }
   showStatic();
   rows($('cur'), [['Wi-Fi', p.ssid || '(none)'], ['IP address', s.ip ? `${s.ip} (${s.ip_mode === 'static' ? 'static' : 'DHCP'})` : null],
                   ['DNS', s.dns || null], ['signal', s.rssi_dbm !== null ? `${s.rssi_dbm} dBm` : null],
-                  ['TX power', `${s.tx_power_dbm} dBm max`]]);
+                  ['TX power', `${s.tx_power_dbm} dBm max${s.tx_auto ? ' (auto)' : ''}`]]);
   adminSet = p.admin_set;
   $('noadmin').hidden = adminSet;
   $('pwbox').hidden = !adminSet;
@@ -146,7 +152,8 @@ $('dev').onsubmit = async ev => {
   ev.preventDefault();
   const pw = adminPw('dev-msg'); if (!pw) return;
   const r = await post('/api/config', { hostname: $('hostname').value.trim(), tz: $('tz').value.trim(), led: $('led').value,
-                                        health_s: $('health_s').value, auto_check: $('auto_check').checked ? 1 : 0 }, pw);
+                                        health_s: $('health_s').value, auto_check: $('auto_check').checked ? 1 : 0,
+                                        motion: $('motion').checked ? 1 : 0 }, pw);
   say('dev-msg', (await r.text()).trim(), r.ok ? 'ok' : 'err');
   if (r.ok) load();
 };

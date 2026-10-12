@@ -1,6 +1,6 @@
 # Build the firmware in Espressif's ESP-IDF container.
-#   - push a tag v*  -> build both variants and publish a GitHub release with the binaries
-#   - manual run     -> build both variants; binaries are attached to the run as artifacts
+#   - push a tag v*  -> build and publish a GitHub release with the binaries
+#   - manual run     -> build; binaries are attached to the run as artifacts
 name: Build firmware
 
 on:
@@ -15,9 +15,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container: espressif/idf:v6.0.3
-    strategy:
-      matrix:
-        variant: [default, motion]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,18 +26,13 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"  # container runs as another user
           . "$IDF_PATH/export.sh"
-          if [ "${{ matrix.variant }}" = motion ]; then
-            idf.py -D SDKCONFIG=build/sdkconfig -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.motion" build merge-bin
-          else
-            idf.py build merge-bin
-          fi
+          idf.py build merge-bin
 
       - name: Collect binaries
         shell: bash
         run: |
           version=$(git describe --tags --always --dirty)
           name=esp32-$version
-          [ "${{ matrix.variant }}" = motion ] && name=$name-motion
           mkdir dist
           cp firmware/build/esp32_status.bin "dist/$name-ota.bin"      # OTA: /update page or ota.sh
           cp firmware/build/merged-binary.bin "dist/$name-full.bin"    # USB: flash at 0x0
@@ -48,7 +40,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ matrix.variant }}
+          name: firmware
           path: dist/
           if-no-files-found: error
 
@@ -69,19 +61,20 @@ jobs:
         run: |
           cd dist
           sha256sum *.bin > SHA256SUMS
-          # manifest.json: what the device's "install latest release" reads (see firmware/main/update.h)
+          # manifest.json: what the device's "install latest release" reads (see firmware/main/update.h).
+          # One build since v1.3.0 (motion sensing is a runtime setting); it is also listed as "motion"
+          # so devices still running the old separate motion build find their update.
           v=$GITHUB_REF_NAME
           entry() { printf '"%s_ota":"%s","%s_size":%s,"%s_sha256":"%s"' \
                       "$2" "$1" "$2" "$(stat -c %s "$1")" "$2" "$(sha256sum "$1" | cut -d' ' -f1)"; }
           printf '{"version":"%s",%s,%s}\n' "$v" "$(entry "esp32-$v-ota.bin" default)" \
-                 "$(entry "esp32-$v-motion-ota.bin" motion)" > manifest.json
+                 "$(entry "esp32-$v-ota.bin" motion)" > manifest.json
           cat manifest.json
           cat > notes.md <<'EOF'
           **Files**
           - `*-ota.bin`: app image for over-the-air updates (`/update` page or `ota.sh`)
           - `*-full.bin`: complete flash image for a new or erased board, written over USB at offset 0:
             `esptool.py --chip esp32 -b 115200 write_flash 0x0 esp32-<version>-full.bin`
-          - `*-motion-*`: CSI motion-sensor build (radio always on, no light sleep)
           - `manifest.json`: read by the device's *Install latest release* button on `/update`
 
           After flashing, the board opens the setup network `ESP32-Setup-XXXX` (password `esp32setupXXXX`).

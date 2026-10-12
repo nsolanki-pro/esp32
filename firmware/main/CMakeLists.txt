@@ -1,9 +1,6 @@
-set(srcs "main.c" "rxstats.c" "ota.c" "settings.c" "provision.c" "update.c" "httputil.c" "logbuf.c" "web.c")
-set(embed "update.html" "setup.html" "settings.html" "index.html" "logs.html" "app.css" "app.js")
-if(CONFIG_APP_CSI_MOTION)
-    list(APPEND srcs "motion.c")
-    list(APPEND embed "motion.html")
-endif()
+set(srcs "main.c" "rxstats.c" "ota.c" "settings.c" "provision.c" "update.c" "httputil.c" "logbuf.c" "web.c"
+         "motion.c")
+set(embed "update.html" "setup.html" "settings.html" "index.html" "logs.html" "app.css" "app.js" "motion.html")
 
 idf_component_register(SRCS ${srcs}
                        INCLUDE_DIRS "."

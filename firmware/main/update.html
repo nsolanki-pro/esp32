@@ -38,7 +38,6 @@ probation and the device comes back here if it can't reach the network within 5 
 <script>
 const msg = (text, cls) => say('msg', text, cls);
 const lock = on => document.querySelectorAll('button').forEach(b => b.disabled = on);
-const VARIANT_INFO = { default: 'low power: light sleep + Wi-Fi power save', motion: 'Wi-Fi CSI motion sensor, radio always on (~100 mA)' };
 let before = null, other = null;
 
 async function status() { return getJSON('/api/status'); }
@@ -52,20 +51,17 @@ function showCurrent(s) {
 // ----- latest GitHub release -----
 
 function showRelease(u) {
-  $('repo').textContent = `From github.com/${u.repo}. This device runs the ${u.variant} build (${VARIANT_INFO[u.variant] || ''}).`;
+  $('repo').textContent = `From github.com/${u.repo}.`;
   const info = $('rel-info'), box = $('variants');
   box.innerHTML = '';
   if (u.state === 'failed') { info.textContent = 'Check failed: ' + u.msg; info.className = 'msg err'; return; }
   if (!u.checked) return;
   if (u.newer) { info.textContent = `Update available: ${u.latest} (installed: ${u.current}).`; info.className = 'msg warn'; }
   else { info.textContent = `Up to date: ${u.current} (latest release: ${u.latest}).`; info.className = 'msg ok'; }
-  for (const v of u.variants) {
-    const same = v.name === u.variant;
-    if (same && !u.newer) continue;
+  if (u.newer && u.variants.some(v => v.name === u.variant)) {
     const b = document.createElement('button');
-    b.textContent = same ? `Install ${u.latest}` : `Switch to the ${v.name} build (${u.latest})`;
-    b.title = VARIANT_INFO[v.name] || v.file;
-    b.onclick = () => install(v.name, same ? null : `Switch to the ${v.name} build (${VARIANT_INFO[v.name] || v.file})?`);
+    b.textContent = `Install ${u.latest}`;
+    b.onclick = () => install(u.variant);
     box.appendChild(b);
   }
 }
@@ -84,9 +80,8 @@ async function check() {
 }
 $('check').onclick = check;
 
-async function install(variant, question) {
+async function install(variant) {
   const pw = adminPw('msg'); if (!pw) return;
-  if (question && !confirm(question)) return;
   try { before = await status(); } catch (e) {}
   lock(true);
   msg('Starting...');
@@ -100,7 +95,7 @@ async function install(variant, question) {
     if (u.state === 'failed') { msg('Update failed: ' + u.msg, 'err'); $('prog').hidden = true; lock(false); return; }
     if (u.size) $('prog').value = u.done / u.size;
     if (u.state === 'rebooting') break;
-    msg(u.state === 'downloading' && u.done ? `Downloading ${u.latest} (${u.installing}): ${Math.round(u.done / 1024)} / ${Math.round(u.size / 1024)} KB`
+    msg(u.state === 'downloading' && u.done ? `Downloading ${u.latest}: ${Math.round(u.done / 1024)} / ${Math.round(u.size / 1024)} KB`
                                             : 'Contacting GitHub...');
   }
   $('prog').value = 1;

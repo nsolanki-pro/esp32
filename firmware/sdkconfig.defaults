@@ -19,3 +19,6 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # Clock: SNTP re-sync every 6 h; log lines carry wall-clock time once synced (see /logs)
 CONFIG_LWIP_SNTP_UPDATE_DELAY=21600000
 CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM=y
+
+# Wi-Fi CSI for the motion sensor (switched on at runtime in the settings)
+CONFIG_ESP_WIFI_CSI_ENABLED=y

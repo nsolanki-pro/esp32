@@ -1,2 +1,0 @@
-# Overlay for the CSI motion-sensor build (radio always on, no power save)
-CONFIG_APP_CSI_MOTION=y

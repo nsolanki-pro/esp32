@@ -1,16 +1,7 @@
 menu "App"
 
-    config APP_CSI_MOTION
-        bool "Wi-Fi CSI motion sensor (radio always on, disables power save)"
-        default n
-        select ESP_WIFI_CSI_ENABLED
-        help
-            Detect movement from Wi-Fi channel state information. Needs the receiver on
-            continuously (~100+ mA), so light sleep and Wi-Fi power save are turned off.
-
     config APP_LISTEN_INTERVAL
         int "Wi-Fi power save: wake every N beacons"
-        depends on !APP_CSI_MOTION
         range 1 10
         default 3
         help
@@ -33,7 +24,7 @@ menu "App"
             Backstop for stuck states. The Wi-Fi driver is restarted once after 5 min down;
             if it is still down after this many seconds, the chip reboots.
 
-config APP_UPDATE_REPO
+    config APP_UPDATE_REPO
         string "GitHub repository for firmware updates"
         default "nsolanki-pro/esp32"
         help

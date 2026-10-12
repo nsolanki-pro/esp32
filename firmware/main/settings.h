@@ -11,6 +11,7 @@
 
 #define SETTINGS_ADMIN_MIN_LEN 8
 #define SETTINGS_DEFAULT_HOSTNAME "esp32"
+#define SETTINGS_TX_AUTO 255  // tx_dbm value: tune the transmit power automatically
 
 typedef enum { LED_OFF = 0, LED_ACTIVITY = 1, LED_CONNECTED = 2 } led_mode_t;
 
@@ -25,10 +26,11 @@ typedef struct {
     uint8_t led;         // led_mode_t
     bool auto_check;     // check GitHub for a newer release once a day
     uint16_t health_s;   // gateway check interval
+    bool motion;         // CSI motion sensing (radio always on: no light sleep / power save)
 
     // Network options (/api/net): applied with a connection test, reverted if it fails.
     uint8_t listen;      // Wi-Fi power save: wake every N beacons
-    uint8_t tx_dbm;      // maximum Wi-Fi transmit power
+    uint8_t tx_dbm;      // maximum Wi-Fi transmit power, or SETTINGS_TX_AUTO
     uint32_t ip, mask, gw, dns;  // static IPv4 (network byte order); ip == 0: DHCP
 } settings_t;
 
@@ -48,7 +50,8 @@ esp_err_t settings_save_admin(const char *admin);
 const char *settings_hostname(void);
 uint32_t settings_health_s(void);
 int settings_listen(void);
-int settings_tx_dbm(void);
+int settings_tx_dbm(void);  // fixed setting, or full power when automatic (the starting point)
+bool settings_tx_auto(void);
 
 // Replace the device and network options in RAM (not Wi-Fi or admin password). Takes effect for
 // readers right away; settings_save_options() then writes them to flash.
