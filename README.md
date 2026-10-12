@@ -53,7 +53,7 @@ comes back alongside normal reconnect attempts. Changing Wi-Fi from there needs 
 | Page | |
 |---|---|
 | `/` | Status: IP, signal, uptime, gateway health, firmware version |
-| `/update` | Firmware upload (admin password) |
+| `/update` | Install the latest GitHub release, or upload a firmware file (admin password) |
 | `/settings` | Change admin password, factory reset |
 | `/setup` | Change Wi-Fi network (admin password once set) |
 | `/api/power` | Time spent active / idle / in light sleep |
@@ -63,7 +63,19 @@ comes back alongside normal reconnect attempts. Changing Wi-Fi from there needs 
 
 Updates replace only the app; Wi-Fi settings and the admin password are kept.
 
-**From the browser:** open `/update`, choose `esp32-<version>-ota.bin` (from a release, or
+**Latest release, one click:** open `/update`. The board checks GitHub for the newest release and
+shows *Update available: vX.Y.Z* with an **Install** button. Enter the admin password and press it:
+the board downloads the image itself over HTTPS, checks its SHA-256 against the release's
+`manifest.json` and the image format, and only then switches to it (about 15-20 s, then the usual
+probation and rollback). Nothing is installed or even checked unless you open the page or ask:
+there is no background polling. Right after a release is published, GitHub may keep reporting the
+previous one as "latest" for a few minutes.
+
+The repository is a build option (`idf.py menuconfig` → *App* → *GitHub repository for firmware
+updates*, empty disables it). API: `GET /api/update`, `POST /api/update/check`,
+`POST /api/update/install` (admin password).
+
+**Upload a file from the browser:** open `/update`, choose `esp32-<version>-ota.bin` (from a release, or
 `firmware/build/esp32_status.bin` from your own build), enter the admin password, **Upload**. The page
 follows the reboot and reports *confirmed* or *rolled back*.
 
@@ -132,6 +144,7 @@ git tag v1.1.0 && git push origin v1.1.0
 | `esp32-<version>-full.bin` | USB flash at offset `0x0` (new or erased board) |
 | `esp32-<version>-motion-*` | Same, CSI motion variant |
 | `SHA256SUMS` | Checksums |
+| `manifest.json` | Version, file names and SHA-256 that the device reads for one-click updates |
 
 The version shown by the device comes from `git describe`, so a tagged build reports `v1.1.0`.
 The workflow can also be run manually (*Actions → Build firmware → Run workflow*); the binaries are
@@ -146,6 +159,9 @@ then attached to the run instead of a release.
   mode, whoever configures it first owns it.
 - Firmware images are validated (format, chip, project, checksums) but not cryptographically signed.
   Anyone with the admin password can install any image built for this project.
+- One-click updates trust the GitHub repository: TLS proves the files come from GitHub and the
+  SHA-256 proves they are intact, but anyone who can publish a release there can ship firmware to
+  devices that press *Install*.
 
 ## License
 
