@@ -1032,6 +1032,14 @@ static void http_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.max_uri_handlers = 40;
     cfg.lru_purge_enable = true;  // phones on the setup AP open many sockets
+    // Browsers keep idle connections open, and a phone that leaves never closes its own. Without
+    // a limit they would take every lwIP socket and outgoing connections (GitHub, ping) would fail
+    // until a reboot: keep the web server below CONFIG_LWIP_MAX_SOCKETS and drop dead peers.
+    cfg.max_open_sockets = 7;
+    cfg.keep_alive_enable = true;
+    cfg.keep_alive_idle = 60;
+    cfg.keep_alive_interval = 10;
+    cfg.keep_alive_count = 3;
     httpd_handle_t server;
     ESP_ERROR_CHECK(httpd_start(&server, &cfg));
     const httpd_uri_t status = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get };

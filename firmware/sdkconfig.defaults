@@ -11,6 +11,8 @@ CONFIG_ESP_WIFI_SLP_IRAM_OPT=y
 
 # IPv4 only: skip IPv6 multicast/ND processing
 CONFIG_LWIP_IPV6=n
+# 7 for web clients + 3 for the web server itself + outgoing: GitHub TLS, ping, setup DNS
+CONFIG_LWIP_MAX_SOCKETS=16
 
 # OTA: two 1.7 MB app slots; bootloader rolls back an unconfirmed new image
 CONFIG_PARTITION_TABLE_TWO_OTA_LARGE=y
