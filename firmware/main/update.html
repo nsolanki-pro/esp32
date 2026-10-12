@@ -2,30 +2,29 @@
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32 firmware update</title>
-<style>
-body{font-family:system-ui,sans-serif;margin:2em;max-width:32em}
-td{padding:.25em 1em .25em 0}td:first-child{color:#666}
-h3{margin-top:1.6em}
-label{display:block;margin:.8em 0 .3em}
-input[type=password]{width:100%;box-sizing:border-box;padding:.4em}
-button{margin-top:1em;padding:.5em 1.2em}
-progress{width:100%;height:1.2em;margin-top:1em}
-#msg,#rel-info{margin-top:1em;white-space:pre-wrap}
-.ok{color:#080}.err{color:#c00}.warn{color:#a60}.hint{color:#666;font-size:.9em}
-</style></head>
+<link rel="stylesheet" href="/app.css">
+</head>
 <body>
-<h2>Firmware update</h2>
+<h2>Firmware</h2>
 <table id="cur"></table>
 
-<label for="tok">Admin password</label>
-<input id="tok" type="password" autocomplete="off">
-<label><input id="remember" type="checkbox"> remember in this browser</label>
+<div class="box">
+  <label for="pw">Admin password <span class="hint">(needed to install or switch)</span></label>
+  <input id="pw" type="password" autocomplete="current-password">
+  <label class="inline"><input id="remember" type="checkbox"> remember in this browser</label>
+</div>
 
 <h3>Latest release</h3>
 <p class="hint" id="repo"></p>
-<div id="rel-info">Checking GitHub...</div>
+<div id="rel-info" class="msg">Checking GitHub...</div>
+<div id="variants"></div>
 <button id="check">Check again</button>
-<button id="install" hidden>Install</button>
+
+<h3>App slots</h3>
+<p class="hint">The device keeps two firmware images. Booting the other one works like an update: it runs on
+probation and the device comes back here if it can't reach the network within 5 minutes.</p>
+<table id="slots"></table>
+<button id="swap" hidden></button>
 
 <h3>Upload a file</h3>
 <p class="hint">An <code>-ota.bin</code> from a release, or <code>build/esp32_status.bin</code> from your own build.</p>
@@ -33,79 +32,65 @@ progress{width:100%;height:1.2em;margin-top:1em}
 <br><button id="go">Upload</button>
 
 <progress id="prog" value="0" max="1" hidden></progress>
-<div id="msg"></div>
-<p><a href="/">Status</a> · <a href="/settings">Settings</a></p>
+<div id="msg" class="msg"></div>
 
+<script src="/app.js"></script>
 <script>
-const $ = id => document.getElementById(id);
-const msg = (text, cls) => { $('msg').textContent = text; $('msg').className = cls || ''; };
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const buttons = ['check', 'install', 'go'];
-const lock = on => buttons.forEach(b => $(b).disabled = on);
-let before = null;
+const msg = (text, cls) => say('msg', text, cls);
+const lock = on => document.querySelectorAll('button').forEach(b => b.disabled = on);
+const VARIANT_INFO = { default: 'low power: light sleep + Wi-Fi power save', motion: 'Wi-Fi CSI motion sensor, radio always on (~100 mA)' };
+let before = null, other = null;
 
-try { const t = localStorage.getItem('admin_pw'); if (t) { $('tok').value = t; $('remember').checked = true; } } catch (e) {}
-
-function password() {
-  const tok = $('tok').value.trim();
-  if (!tok) { msg('Enter the admin password.', 'err'); $('tok').focus(); return null; }
-  try { $('remember').checked ? localStorage.setItem('admin_pw', tok) : localStorage.removeItem('admin_pw'); } catch (e) {}
-  return tok;
-}
-
-async function status() { return (await fetch('/api/status', { cache: 'no-store' })).json(); }
-async function upd() { return (await fetch('/api/update', { cache: 'no-store' })).json(); }
+async function status() { return getJSON('/api/status'); }
+async function upd() { return getJSON('/api/update'); }
 
 function showCurrent(s) {
-  const rows = [['firmware', s.firmware], ['built', s.built], ['partition', s.partition],
-                ['on probation', s.ota_pending], ['last rollback', s.rolled_back_from ?? 'none'],
-                ['uptime', s.uptime_s + ' s']];
-  $('cur').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td></td></tr>`).join('');
-  [...$('cur').querySelectorAll('td:last-child')].forEach((td, i) => td.textContent = rows[i][1]);
+  rows($('cur'), [['firmware', s.firmware], ['built', s.built], ['running from', s.partition + (s.ota_pending ? ', on probation' : '')],
+                  ['last rollback', s.rolled_back_from], ['uptime', duration(s.uptime_s)]]);
 }
 
 // ----- latest GitHub release -----
 
 function showRelease(u) {
-  $('repo').textContent = `From github.com/${u.repo} (${u.variant} build)`;
-  const info = $('rel-info');
-  $('install').hidden = true;
-  if (u.state === 'failed') { info.textContent = 'Check failed: ' + u.msg; info.className = 'err'; return; }
+  $('repo').textContent = `From github.com/${u.repo}. This device runs the ${u.variant} build (${VARIANT_INFO[u.variant] || ''}).`;
+  const info = $('rel-info'), box = $('variants');
+  box.innerHTML = '';
+  if (u.state === 'failed') { info.textContent = 'Check failed: ' + u.msg; info.className = 'msg err'; return; }
   if (!u.checked) return;
-  if (u.newer) {
-    info.textContent = `Update available: ${u.latest} (installed: ${u.current}).`;
-    info.className = 'warn';
-    $('install').textContent = `Install ${u.latest}`;
-    $('install').hidden = false;
-  } else {
-    info.textContent = `Up to date: ${u.current} (latest release: ${u.latest}).`;
-    info.className = 'ok';
+  if (u.newer) { info.textContent = `Update available: ${u.latest} (installed: ${u.current}).`; info.className = 'msg warn'; }
+  else { info.textContent = `Up to date: ${u.current} (latest release: ${u.latest}).`; info.className = 'msg ok'; }
+  for (const v of u.variants) {
+    const same = v.name === u.variant;
+    if (same && !u.newer) continue;
+    const b = document.createElement('button');
+    b.textContent = same ? `Install ${u.latest}` : `Switch to the ${v.name} build (${u.latest})`;
+    b.title = VARIANT_INFO[v.name] || v.file;
+    b.onclick = () => install(v.name, same ? null : `Switch to the ${v.name} build (${VARIANT_INFO[v.name] || v.file})?`);
+    box.appendChild(b);
   }
 }
 
-// Ask the device to (re)check GitHub, then wait for the result.
 async function check() {
   lock(true);
-  $('rel-info').textContent = 'Checking GitHub...'; $('rel-info').className = '';
+  $('rel-info').textContent = 'Checking GitHub...'; $('rel-info').className = 'msg';
   try {
     const r = await fetch('/api/update/check', { method: 'POST' });
     if (!r.ok && r.status !== 409) throw new Error(await r.text());
     let u;
     do { await sleep(700); u = await upd(); } while (u.state === 'checking');
     showRelease(u);
-  } catch (e) { $('rel-info').textContent = 'Check failed: ' + e.message; $('rel-info').className = 'err'; }
+  } catch (e) { $('rel-info').textContent = 'Check failed: ' + e.message; $('rel-info').className = 'msg err'; }
   lock(false);
 }
-
 $('check').onclick = check;
 
-$('install').onclick = async () => {
-  const tok = password();
-  if (!tok) return;
+async function install(variant, question) {
+  const pw = adminPw('msg'); if (!pw) return;
+  if (question && !confirm(question)) return;
   try { before = await status(); } catch (e) {}
   lock(true);
   msg('Starting...');
-  const r = await fetch('/api/update/install', { method: 'POST', headers: { 'X-Admin-Password': tok } });
+  const r = await fetch('/api/update/install?variant=' + encodeURIComponent(variant), { method: 'POST', headers: { 'X-Admin-Password': pw } });
   if (r.status !== 202) { msg(`Rejected (${r.status}): ${await r.text()}`, 'err'); lock(false); return; }
   $('prog').hidden = false; $('prog').value = 0;
   for (;;) {
@@ -115,11 +100,45 @@ $('install').onclick = async () => {
     if (u.state === 'failed') { msg('Update failed: ' + u.msg, 'err'); $('prog').hidden = true; lock(false); return; }
     if (u.size) $('prog').value = u.done / u.size;
     if (u.state === 'rebooting') break;
-    msg(u.state === 'downloading' && u.done ? `Downloading ${u.latest}: ${Math.round(u.done / 1024)} / ${Math.round(u.size / 1024)} KB`
+    msg(u.state === 'downloading' && u.done ? `Downloading ${u.latest} (${u.installing}): ${Math.round(u.done / 1024)} / ${Math.round(u.size / 1024)} KB`
                                             : 'Contacting GitHub...');
   }
   $('prog').value = 1;
   msg('Installed and verified. Waiting for the board to reboot...');
+  watch();
+}
+
+// ----- app slots -----
+
+async function showSlots() {
+  const d = await getJSON('/api/slots');
+  const t = $('slots');
+  t.innerHTML = '';
+  other = null;
+  for (const s of d.slots) {
+    const tr = t.insertRow();
+    tr.insertCell().textContent = s.label;
+    const where = s.running ? 'running' : s.boot ? 'boots next' : '';
+    tr.insertCell().textContent = s.app ? `${s.version}, built ${s.built} · ${s.state}${where ? ' · ' + where : ''}` : 'empty';
+    if (!s.running && s.app) other = s;
+  }
+  const b = $('swap');
+  b.hidden = !other || d.probation;
+  if (other) {
+    b.textContent = `Boot ${other.version} (${other.label})`;
+    if (other.state === 'rolled back' || other.state === 'aborted') b.textContent += ' – it failed before';
+  }
+}
+
+$('swap').onclick = async () => {
+  const pw = adminPw('msg'); if (!pw) return;
+  if (!confirm(`Reboot into ${other.version} from ${other.label}?`)) return;
+  try { before = await status(); } catch (e) {}
+  lock(true);
+  const r = await post('/api/slots/boot', { slot: other.label }, pw);
+  const text = (await r.text()).trim();
+  if (!r.ok) { msg(`Rejected (${r.status}): ${text}`, 'err'); lock(false); return; }
+  msg(text + '. Waiting for the board to reboot...');
   watch();
 };
 
@@ -128,8 +147,7 @@ $('install').onclick = async () => {
 $('go').onclick = async () => {
   const f = $('file').files[0];
   if (!f) return msg('Choose a .bin file first.', 'err');
-  const tok = password();
-  if (!tok) return;
+  const pw = adminPw('msg'); if (!pw) return;
   const head = new Uint8Array(await f.slice(0, 1).arrayBuffer());
   if (head[0] !== 0xE9) return msg('That is not an ESP32 app image (use the -ota.bin, not -full.bin).', 'err');
 
@@ -140,7 +158,7 @@ $('go').onclick = async () => {
 
   const xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/ota');
-  xhr.setRequestHeader('X-Admin-Password', tok);
+  xhr.setRequestHeader('X-Admin-Password', pw);
   xhr.setRequestHeader('Content-Type', 'application/octet-stream');
   xhr.upload.onprogress = e => { if (e.lengthComputable) $('prog').value = e.loaded / e.total; };
   xhr.onerror = () => { msg('Upload failed (connection error).', 'err'); lock(false); };
@@ -165,12 +183,11 @@ function watch() {
     if (!seenDown && s.partition === oldPart && s.uptime_s > secs) return setTimeout(tick, 2000);  // not rebooted yet
     showCurrent(s);
     if (s.partition === oldPart) {
-      msg(`Update rolled back: ${s.rolled_back_from} did not confirm. Still running ${s.firmware} on ${s.partition}.`, 'err');
-      lock(false);
+      msg(`Rolled back: ${s.rolled_back_from} did not confirm. Still running ${s.firmware} on ${s.partition}.`, 'err');
+      lock(false); showSlots();
     } else if (!s.ota_pending) {
       msg(`Done: running ${s.firmware} on ${s.partition}, confirmed.`, 'ok');
-      lock(false);
-      check();
+      lock(false); showSlots(); check();
     } else if (secs > 420) {
       msg('Timed out waiting for confirmation.', 'err');
       lock(false);
@@ -183,6 +200,7 @@ function watch() {
 }
 
 status().then(s => { before = s; showCurrent(s); }).catch(() => {});
+showSlots().catch(() => {});
 check();
 </script>
 </body></html>

@@ -1,6 +1,5 @@
 #include "provision.h"
 
-#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +16,7 @@
 #include "freertos/task.h"
 #include "lwip/sockets.h"
 #include "sdkconfig.h"
+#include "httputil.h"
 #include "settings.h"
 
 #define AP_CHANNEL        1
@@ -24,7 +24,6 @@
 #define TRIAL_TIMEOUT_S   25
 #define TRIAL_MAX_TRIES   3
 #define REBOOT_DELAY_MS   4000  // after a successful setup: time for the page to show the new IP
-#define BODY_MAX          512
 #define TRIAL_START_MS    300   // let the HTTP reply leave before the radio changes network
 
 #define DNS_ON_BIT        BIT0
@@ -52,95 +51,6 @@ static struct {
 
 // ---------- helpers ----------
 
-size_t prov_json_str(char *out, size_t len, const char *s)
-{
-    size_t o = 0;
-    if (len < 3) {
-        return 0;
-    }
-    out[o++] = '"';
-    for (; *s && o + 7 < len; s++) {
-        unsigned char c = *s;
-        if (c == '"' || c == '\\') {
-            out[o++] = '\\';
-            out[o++] = c;
-        } else if (c < 0x20) {
-            o += snprintf(out + o, len - o, "\\u%04x", c);
-        } else {
-            out[o++] = c;
-        }
-    }
-    out[o++] = '"';
-    out[o] = '\0';
-    return o;
-}
-
-static void url_decode(char *s)
-{
-    char *o = s;
-    for (; *s; s++) {
-        if (*s == '+') {
-            *o++ = ' ';
-        } else if (*s == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2])) {
-            char hex[3] = { s[1], s[2], 0 };
-            *o++ = (char)strtol(hex, NULL, 16);
-            s += 2;
-        } else {
-            *o++ = *s;
-        }
-    }
-    *o = '\0';
-}
-
-// Read a small form-encoded body. Returns a malloc'd NUL-terminated string or NULL.
-static char *read_body(httpd_req_t *req)
-{
-    if (req->content_len <= 0 || req->content_len >= BODY_MAX) {
-        return NULL;
-    }
-    char *body = calloc(1, req->content_len + 1);
-    int got = 0;
-    while (body && got < (int)req->content_len) {
-        int r = httpd_req_recv(req, body + got, req->content_len - got);
-        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
-            continue;
-        }
-        if (r <= 0) {
-            free(body);
-            return NULL;
-        }
-        got += r;
-    }
-    return body;
-}
-
-// Get a form field, URL-decoded. Missing field -> "". Returns false if the value is too long.
-static bool form_field(const char *body, const char *key, char *out, size_t len)
-{
-    char raw[3 * 65];
-    esp_err_t err = httpd_query_key_value(body, key, raw, sizeof(raw));
-    if (err == ESP_ERR_NOT_FOUND) {
-        out[0] = '\0';
-        return true;
-    }
-    if (err != ESP_OK) {
-        return false;
-    }
-    url_decode(raw);
-    if (strlen(raw) >= len) {
-        return false;
-    }
-    strcpy(out, raw);
-    return true;
-}
-
-static esp_err_t send_text(httpd_req_t *req, const char *status, const char *msg)
-{
-    httpd_resp_set_status(req, status);
-    httpd_resp_set_type(req, "text/plain");
-    return httpd_resp_sendstr(req, msg);
-}
-
 static bool s_wipe_on_reboot;
 
 static void reboot_cb(void *arg)
@@ -164,9 +74,7 @@ void prov_set_sta(const char *ssid, const char *pass)
     strlcpy((char *)c.sta.ssid, ssid, sizeof(c.sta.ssid));
     strlcpy((char *)c.sta.password, pass, sizeof(c.sta.password));
     c.sta.threshold.authmode = pass[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-#if !CONFIG_APP_CSI_MOTION
-    c.sta.listen_interval = CONFIG_APP_LISTEN_INTERVAL;
-#endif
+    c.sta.listen_interval = settings_listen();  // 0 (motion build) = driver default
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &c));
 }
 
@@ -400,14 +308,14 @@ static esp_err_t settings_page_get(httpd_req_t *req)
 static esp_err_t setup_state_get(httpd_req_t *req)
 {
     static const char *names[] = { "idle", "connecting", "ok", "failed" };
-    char ssid[80], tssid[80], body[400];
-    prov_json_str(ssid, sizeof(ssid), settings()->ssid);
-    prov_json_str(tssid, sizeof(tssid), s_trial.ssid);
+    char ssid[80], tssid[80], body[440];
+    json_str(ssid, sizeof(ssid), settings()->ssid);
+    json_str(tssid, sizeof(tssid), s_trial.ssid);
     snprintf(body, sizeof(body),
-             "{\"configured\":%s,\"admin_set\":%s,\"ssid\":%s,\"ap\":%s,"
+             "{\"configured\":%s,\"admin_set\":%s,\"ssid\":%s,\"ap\":%s,\"hostname\":\"%s\","
              "\"state\":\"%s\",\"trial_ssid\":%s,\"msg\":\"%s\",\"ip\":\"%s\"}",
              settings_have_wifi() ? "true" : "false", settings_have_admin() ? "true" : "false", ssid,
-             s_ap ? "true" : "false", names[s_trial.state], tssid, s_trial.msg, s_trial.ip);
+             s_ap ? "true" : "false", settings_hostname(), names[s_trial.state], tssid, s_trial.msg, s_trial.ip);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_sendstr(req, body);
@@ -420,17 +328,17 @@ static esp_err_t setup_post(httpd_req_t *req)
         return ESP_OK;
     }
     if (s_trial.state == TRIAL_CONNECTING || s_trial.state == TRIAL_OK) {
-        return send_text(req, "409 Conflict", "a setup attempt is already in progress\n");
+        return http_send_text(req, "409 Conflict", "a setup attempt is already in progress\n");
     }
-    char *body = read_body(req);
+    char *body = http_read_body(req);
     if (!body) {
-        return send_text(req, "400 Bad Request", "missing or oversized form\n");
+        return http_send_text(req, "400 Bad Request", "missing or oversized form\n");
     }
     char ssid[33], pass[65], admin[65];
-    bool ok = form_field(body, "ssid", ssid, sizeof(ssid)) && form_field(body, "pass", pass, sizeof(pass)) &&
-              form_field(body, "admin", admin, sizeof(admin));
-    memset(body, 0, strlen(body));
-    free(body);
+    bool ok = http_form_field(body, "ssid", ssid, sizeof(ssid), NULL) &&
+              http_form_field(body, "pass", pass, sizeof(pass), NULL) &&
+              http_form_field(body, "admin", admin, sizeof(admin), NULL);
+    http_free_body(body);
     const char *err = !ok                                          ? "field too long\n"
                       : !ssid[0]                                   ? "network name is empty\n"
                       : pass[0] && strlen(pass) < 8                ? "Wi-Fi password must be 8-63 characters (or empty for an open network)\n"
@@ -438,7 +346,7 @@ static esp_err_t setup_post(httpd_req_t *req)
                       : admin[0] && strlen(admin) < SETTINGS_ADMIN_MIN_LEN ? "admin password must be at least 8 characters\n"
                                                                    : NULL;
     if (err) {
-        return send_text(req, "400 Bad Request", err);
+        return http_send_text(req, "400 Bad Request", err);
     }
 
     strlcpy(s_trial.ssid, ssid, sizeof(s_trial.ssid));
@@ -453,7 +361,7 @@ static esp_err_t setup_post(httpd_req_t *req)
 
     // Reply first, then switch: connecting drops the LAN link, and may move the AP's channel.
     esp_timer_start_once(s_trial_start_timer, TRIAL_START_MS * 1000);
-    return send_text(req, "202 Accepted", "trying\n");
+    return http_send_text(req, "202 Accepted", "trying\n");
 }
 
 // GET /api/scan
@@ -482,7 +390,7 @@ static esp_err_t scan_get(httpd_req_t *req)
             continue;
         }
         char name[80], item[128];
-        prov_json_str(name, sizeof(name), (char *)recs[i].ssid);
+        json_str(name, sizeof(name), (char *)recs[i].ssid);
         snprintf(item, sizeof(item), "%s{\"ssid\":%s,\"rssi\":%d,\"open\":%s}", first ? "" : ",", name,
                  recs[i].rssi, recs[i].authmode == WIFI_AUTH_OPEN ? "true" : "false");
         httpd_resp_send_chunk(req, item, HTTPD_RESP_USE_STRLEN);
@@ -499,20 +407,17 @@ static esp_err_t admin_post(httpd_req_t *req)
     if (settings_have_admin() && !settings_require_admin(req)) {
         return ESP_OK;
     }
-    char *body = read_body(req);
+    char *body = http_read_body(req);
     char pw[65];
-    bool ok = body && form_field(body, "new", pw, sizeof(pw));
-    if (body) {
-        memset(body, 0, strlen(body));
-        free(body);
-    }
+    bool ok = body && http_form_field(body, "new", pw, sizeof(pw), NULL);
+    http_free_body(body);
     if (!ok || strlen(pw) < SETTINGS_ADMIN_MIN_LEN) {
-        return send_text(req, "400 Bad Request", "admin password must be 8-64 characters\n");
+        return http_send_text(req, "400 Bad Request", "admin password must be 8-64 characters\n");
     }
     esp_err_t err = settings_save_admin(pw);
     memset(pw, 0, sizeof(pw));
-    return err == ESP_OK ? send_text(req, "200 OK", "admin password saved\n")
-                         : send_text(req, "500 Internal Server Error", "could not save\n");
+    return err == ESP_OK ? http_send_text(req, "200 OK", "admin password saved\n")
+                         : http_send_text(req, "500 Internal Server Error", "could not save\n");
 }
 
 // POST /api/reset
@@ -522,11 +427,11 @@ static esp_err_t reset_post(httpd_req_t *req)
         return ESP_OK;
     }
     if (settings_erase() != ESP_OK) {
-        return send_text(req, "500 Internal Server Error", "could not erase settings\n");
+        return http_send_text(req, "500 Internal Server Error", "could not erase settings\n");
     }
     s_wipe_on_reboot = true;  // done just before restarting, so this reply still gets out
     reboot_later();
-    return send_text(req, "200 OK", "settings erased; rebooting into setup mode\n");
+    return http_send_text(req, "200 OK", "settings erased; rebooting into setup mode\n");
 }
 
 // Captive portal: while the setup AP is up, send unknown URLs (OS connectivity checks) to /setup.

@@ -1,0 +1,62 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 status</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<h2>Status</h2>
+<div id="banner" class="banner" hidden></div>
+<table id="net"></table>
+<h3>Health</h3>
+<table id="health"></table>
+<h3>System</h3>
+<table id="sys"></table>
+<h3>Device</h3>
+<table id="dev"></table>
+<p class="hint" id="links"><a href="/api/status">JSON</a> · <a href="/api/power">power stats</a> · <a href="/api/wakes">what wakes the radio</a></p>
+
+<script src="/app.js"></script>
+<script>
+const yes = b => b === null || b === undefined ? null : b ? 'yes' : 'no';
+
+async function refresh() {
+  let s;
+  try { s = await getJSON('/api/status'); } catch (e) { return; }
+  const ago = s.gateway_checked_s_ago >= 0 ? ` (${duration(s.gateway_checked_s_ago)} ago)` : '';
+  rows($('net'), [
+    ['hostname', `${s.hostname}.local`],
+    ['network', s.ssid || '(not configured)'],
+    ['connected', yes(s.connected)],
+    ['IP address', s.ip ? `${s.ip} (${s.ip_mode === 'static' ? 'static' : 'DHCP'})` : null],
+    ['DNS server', s.dns || undefined],
+    ['signal', s.rssi_dbm !== null ? `${s.rssi_dbm} dBm` : null],
+    ['TX power', `${s.tx_power_dbm} dBm max`],
+    ['setup network', s.setup_ap ? 'open (fallback)' : undefined],
+  ]);
+  rows($('health'), [
+    ['gateway', s.gateway_ok === null ? 'not checked yet' : (s.gateway_ok ? `ok, ${s.gateway_rtt_ms} ms` : `not answering (${s.gateway_fails}×)`) + ago],
+    ['Wi-Fi connects', s.wifi_connects],
+    ['recoveries', `${s.recovery_reconnects} reconnects, ${s.recovery_wifi_restarts} Wi-Fi restarts, ${s.recovery_net_reverts} network-option resets`],
+  ]);
+  rows($('sys'), [
+    ['time', s.time || 'not synced yet'],
+    ['uptime', duration(s.uptime_s)],
+    ['last reset', s.reset_reason],
+    ['firmware', `${s.firmware} (built ${s.built})`],
+    ['running from', s.partition + (s.ota_pending ? ', on probation' : '')],
+    ['last rollback', s.rolled_back_from],
+    ['free memory', `${Math.round(s.free_heap / 1024)} KB (lowest ${Math.round(s.min_free_heap / 1024)} KB)`],
+    ['power save', yes(s.power_save)],
+    ['HTTP requests', s.http_requests],
+  ]);
+  rows($('dev'), [['chip', s.chip], ['flash', `${s.flash_mb} MB`], ['MAC', s.mac], ['ESP-IDF', s.idf]]);
+  const b = $('banner');
+  b.hidden = !s.update_available;
+  if (s.update_available) b.innerHTML = `Update available: <b></b> · <a href="/update">install</a>`, b.querySelector('b').textContent = s.update_available;
+  if (!s.power_save) $('links').innerHTML = '<a href="/api/status">JSON</a>';
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body></html>

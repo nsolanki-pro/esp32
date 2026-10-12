@@ -15,6 +15,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "ota.h"
+#include "httputil.h"
 #include "provision.h"
 #include "psa/crypto.h"
 #include "sdkconfig.h"
@@ -25,6 +26,9 @@
 #define MANIFEST_MAX  2048
 #define HTTP_TIMEOUT  15000
 #define MAX_REDIRECTS 5
+#define MAX_VARIANTS  4
+#define AUTO_FIRST_S  120             // daily check: first one this long after boot / enabling
+#define AUTO_PERIOD_S (24 * 3600)
 
 #if CONFIG_APP_CSI_MOTION
 #define VARIANT "motion"
@@ -41,15 +45,24 @@ enum { CMD_CHECK = 1, CMD_INSTALL = 2 };
 
 static TaskHandle_t s_task;
 static esp_pm_lock_handle_t s_lock;
+static esp_timer_handle_t s_auto_timer;
+
+typedef struct {
+    char name[16];  // build variant: "default", "motion", ...
+    char file[80];
+    char sha256[65];
+    size_t size;
+} variant_t;
 
 static struct {
     volatile state_t state;
     bool checked;
-    bool newer;
+    bool newer;          // latest release is newer than the running firmware
     char latest[32];
-    char file[80];
-    char sha256[65];
-    size_t size;
+    variant_t var[MAX_VARIANTS];  // images in the latest release, from its manifest
+    int nvar;
+    char want[16];       // variant to install
+    size_t size;         // size of the image being downloaded
     int64_t checked_us;
     volatile size_t done;
     char msg[96];
@@ -195,6 +208,48 @@ static void hex(const uint8_t *in, size_t n, char *out)
 
 // ---------- check / install ----------
 
+static const variant_t *find_variant(const char *name)
+{
+    for (int i = 0; i < s_u.nvar; i++) {
+        if (strcmp(s_u.var[i].name, name) == 0) {
+            return &s_u.var[i];
+        }
+    }
+    return NULL;
+}
+
+// Every "<variant>_ota" key in the manifest is an installable image; the matching _sha256 and
+// _size keys must be there too.
+static int parse_variants(const char *js, variant_t *out)
+{
+    int n = 0;
+    for (const char *p = js; n < MAX_VARIANTS && (p = strstr(p, "_ota\"")); p += 5) {
+        const char *q = p;
+        while (q > js && q[-1] != '"') {
+            q--;
+        }
+        size_t len = p - q;
+        if (q == js || len == 0 || len >= sizeof(out[n].name)) {
+            continue;
+        }
+        variant_t *v = &out[n];
+        memcpy(v->name, q, len);
+        v->name[len] = '\0';
+        char key[32], size[16];
+        snprintf(key, sizeof(key), "%s_ota", v->name);
+        bool ok = json_get(js, key, v->file, sizeof(v->file));
+        snprintf(key, sizeof(key), "%s_sha256", v->name);
+        ok = ok && json_get(js, key, v->sha256, sizeof(v->sha256)) && strlen(v->sha256) == 64;
+        snprintf(key, sizeof(key), "%s_size", v->name);
+        ok = ok && json_get(js, key, size, sizeof(size));
+        if (ok) {
+            v->size = strtoul(size, NULL, 10);
+            n++;
+        }
+    }
+    return n;
+}
+
 static bool do_check(void)
 {
     s_u.state = ST_CHECKING;
@@ -207,26 +262,26 @@ static bool do_check(void)
     char *js = calloc(1, MANIFEST_MAX);
     int n = js ? read_full(c, js, MANIFEST_MAX - 1) : -1;
     esp_http_client_cleanup(c);
-    char latest[32], file[80], sha[65], size[16];
-    bool ok = n > 0 && json_get(js, "version", latest, sizeof(latest)) &&
-              json_get(js, VARIANT "_ota", file, sizeof(file)) &&
-              json_get(js, VARIANT "_sha256", sha, sizeof(sha)) && strlen(sha) == 64 &&
-              json_get(js, VARIANT "_size", size, sizeof(size));
+    char latest[32];
+    variant_t var[MAX_VARIANTS];
+    int nvar = 0;
+    if (n > 0 && json_get(js, "version", latest, sizeof(latest))) {
+        nvar = parse_variants(js, var);
+    }
     free(js);
-    if (!ok) {
+    if (nvar == 0) {
         return fail("release manifest missing or unreadable%s", NULL);
     }
     const char *current = esp_app_get_description()->version;
     strlcpy(s_u.latest, latest, sizeof(s_u.latest));
-    strlcpy(s_u.file, file, sizeof(s_u.file));
-    strlcpy(s_u.sha256, sha, sizeof(s_u.sha256));
-    s_u.size = strtoul(size, NULL, 10);
+    memcpy(s_u.var, var, sizeof(var));
+    s_u.nvar = nvar;
     s_u.newer = is_newer(latest, current);
     s_u.checked = true;
     s_u.checked_us = esp_timer_get_time();
     s_u.state = ST_IDLE;
-    ESP_LOGI(TAG, "latest release %s (%s, %u bytes); installed %s -> %s", latest, file, (unsigned)s_u.size,
-             current, s_u.newer ? "update available" : "up to date");
+    ESP_LOGI(TAG, "latest release %s (%d variant%s); installed %s (%s) -> %s", latest, nvar, nvar == 1 ? "" : "s",
+             current, VARIANT, s_u.newer ? "update available" : "up to date");
     return true;
 }
 
@@ -235,13 +290,19 @@ static bool do_install(void)
     if (!do_check()) {
         return false;
     }
-    if (!s_u.newer) {
+    const variant_t *v = find_variant(s_u.want);
+    if (!v) {
+        return fail("the latest release has no \"%s\" build", s_u.want);
+    }
+    // Same build variant: only forward. Another variant: allowed at any version (switching).
+    if (strcmp(v->name, VARIANT) == 0 && !s_u.newer) {
         return fail("already up to date%s", NULL);
     }
     char url[200];
-    snprintf(url, sizeof(url), BASE_URL "/download/%s/%s", s_u.latest, s_u.file);
-    ESP_LOGI(TAG, "downloading %s", url);
+    snprintf(url, sizeof(url), BASE_URL "/download/%s/%s", s_u.latest, v->file);
+    ESP_LOGI(TAG, "downloading %s (%s build)", url, v->name);
     s_u.state = ST_DOWNLOADING;
+    s_u.size = v->size;
     s_u.done = 0;
 
     int64_t len = 0;
@@ -286,7 +347,7 @@ static bool do_install(void)
             err = "hash failed";
         } else {
             hex(digest, 32, got);
-            if (strcmp(got, s_u.sha256) != 0) {
+            if (strcmp(got, v->sha256) != 0) {
                 err = "SHA-256 mismatch: download corrupted or tampered with";
             }
         }
@@ -300,9 +361,10 @@ static bool do_install(void)
         ota_writer_abort();
         return fail("%s", err);
     }
-    ESP_LOGI(TAG, "%s installed in %d ms (SHA-256 verified), rebooting", s_u.latest, ota_writer_elapsed_ms());
+    ESP_LOGI(TAG, "%s (%s) installed in %d ms (SHA-256 verified), rebooting", s_u.latest, v->name,
+             ota_writer_elapsed_ms());
     s_u.state = ST_REBOOTING;
-    snprintf(s_u.msg, sizeof(s_u.msg), "installed %s, rebooting", s_u.latest);
+    snprintf(s_u.msg, sizeof(s_u.msg), "installed %s (%s build), rebooting", s_u.latest, v->name);
     ota_reboot();
     return true;
 }
@@ -345,19 +407,29 @@ static esp_err_t send_text(httpd_req_t *req, const char *status, const char *msg
 
 static esp_err_t status_get(httpd_req_t *req)
 {
-    char body[512], latest[48], file[100], msg[120];
-    prov_json_str(latest, sizeof(latest), s_u.latest);
-    prov_json_str(file, sizeof(file), s_u.file);
-    prov_json_str(msg, sizeof(msg), s_u.msg);
+    char body[512], latest[48], msg[120];
+    json_str(latest, sizeof(latest), s_u.latest);
+    json_str(msg, sizeof(msg), s_u.msg);
     snprintf(body, sizeof(body),
              "{\"state\":\"%s\",\"repo\":\"%s\",\"variant\":\"%s\",\"current\":\"%s\",\"checked\":%s,"
-             "\"checked_s_ago\":%lld,\"latest\":%s,\"newer\":%s,\"file\":%s,\"size\":%u,\"done\":%u,\"msg\":%s}",
+             "\"checked_s_ago\":%lld,\"auto_check\":%s,\"latest\":%s,\"newer\":%s,\"installing\":\"%s\","
+             "\"size\":%u,\"done\":%u,\"msg\":%s,\"variants\":[",
              STATE_NAMES[s_u.state], CONFIG_APP_UPDATE_REPO, VARIANT, esp_app_get_description()->version,
              s_u.checked ? "true" : "false", s_u.checked ? (esp_timer_get_time() - s_u.checked_us) / 1000000 : -1LL,
-             latest, s_u.newer ? "true" : "false", file, (unsigned)s_u.size, (unsigned)s_u.done, msg);
+             settings()->auto_check ? "true" : "false", latest, s_u.newer ? "true" : "false", s_u.want,
+             (unsigned)s_u.size, (unsigned)s_u.done, msg);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    return httpd_resp_sendstr(req, body);
+    httpd_resp_sendstr_chunk(req, body);
+    for (int i = 0; i < s_u.nvar; i++) {
+        char file[100];
+        json_str(file, sizeof(file), s_u.var[i].file);
+        snprintf(body, sizeof(body), "%s{\"name\":\"%s\",\"file\":%s,\"size\":%u}", i ? "," : "",
+                 s_u.var[i].name, file, (unsigned)s_u.var[i].size);
+        httpd_resp_sendstr_chunk(req, body);
+    }
+    httpd_resp_sendstr_chunk(req, "]}");
+    return httpd_resp_sendstr_chunk(req, NULL);
 }
 
 static esp_err_t start(httpd_req_t *req, uint32_t cmd)
@@ -383,12 +455,51 @@ static esp_err_t check_post(httpd_req_t *req)
     return start(req, CMD_CHECK);
 }
 
+// POST /api/update/install[?variant=motion]  (default: the running build's variant)
 static esp_err_t install_post(httpd_req_t *req)
 {
     if (!settings_require_admin(req)) {
         return ESP_OK;
     }
+    char query[48], want[16] = VARIANT;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "variant", want, sizeof(want)) != ESP_OK) {
+        strcpy(want, VARIANT);
+    }
+    if (!want[0] || strspn(want, "abcdefghijklmnopqrstuvwxyz0123456789_-") != strlen(want)) {
+        return send_text(req, "400 Bad Request", "bad variant name\n");
+    }
+    if (busy()) {
+        return send_text(req, "409 Conflict", "an update or check is already running\n");
+    }
+    strlcpy(s_u.want, want, sizeof(s_u.want));
     return start(req, CMD_INSTALL);
+}
+
+// ---------- optional daily check ----------
+
+const char *update_available(void)
+{
+    return s_u.checked && s_u.newer ? s_u.latest : NULL;
+}
+
+static void auto_cb(void *arg)
+{
+    wifi_ap_record_t ap;
+    if (settings()->auto_check && !busy() && esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        ESP_LOGI(TAG, "daily check");
+        s_u.state = ST_CHECKING;
+        xTaskNotify(s_task, CMD_CHECK, eSetValueWithOverwrite);
+    }
+    esp_timer_start_once(s_auto_timer, (uint64_t)AUTO_PERIOD_S * 1000000);
+}
+
+void update_set_auto(bool on)
+{
+    esp_timer_stop(s_auto_timer);
+    if (on && CONFIG_APP_UPDATE_REPO[0]) {
+        esp_timer_start_once(s_auto_timer, (uint64_t)AUTO_FIRST_S * 1000000);
+    }
 }
 
 void update_register(httpd_handle_t server)
@@ -407,4 +518,7 @@ void update_init(void)
 {
     ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "update", &s_lock));
     xTaskCreate(update_task, "update", 8192, NULL, 4, &s_task);  // TLS needs a deep stack
+    const esp_timer_create_args_t t = { .callback = auto_cb, .name = "update_auto" };
+    ESP_ERROR_CHECK(esp_timer_create(&t, &s_auto_timer));
+    update_set_auto(settings()->auto_check);
 }

@@ -12,6 +12,9 @@ are set on the device.
 - **OTA updates** from the browser or a script; a new image must prove it can reach the network or
   the bootloader rolls back to the previous one
 - **Factory reset** from the web UI or by holding BOOT for 20 s
+- **Web settings**: hostname, time zone (NTP clock), LED mode, static IP, Wi-Fi TX power and power
+  save, reboot, switch between the two firmware slots, live log viewer; network changes are tested
+  and undone automatically if the device loses the network
 - Optional **CSI motion sensor** build (Wi-Fi channel state information, no extra hardware)
 
 ## Quick start (prebuilt release)
@@ -43,7 +46,8 @@ On first boot (or after a factory reset) the board opens a setup network:
 3. Choose an **admin password** (8+ characters). It protects updates, Wi-Fi changes and reset.
 4. **Connect and save.** The board tests the credentials first: a typo gives "wrong password"
    instead of a dead device. On success it shows its new IP address and reboots.
-5. Switch back to your network and open `http://<ip>/` or `http://esp32.local/`.
+5. Switch back to your network and open `http://<ip>/` or `http://esp32.local/` (or the hostname
+   you set later in *Settings*).
 
 If the saved network is unreachable for 2 minutes (router off, password changed), the setup network
 comes back alongside normal reconnect attempts. Changing Wi-Fi from there needs the admin password.
@@ -52,12 +56,41 @@ comes back alongside normal reconnect attempts. Changing Wi-Fi from there needs 
 
 | Page | |
 |---|---|
-| `/` | Status: IP, signal, uptime, gateway health, firmware version |
-| `/update` | Install the latest GitHub release, or upload a firmware file (admin password) |
-| `/settings` | Change admin password, factory reset |
+| `/` | Status: network, gateway health, time, uptime, last reset reason, memory, firmware, chip/flash/MAC |
+| `/logs` | Live log: the last 8 KB of the device log, no USB cable needed (`/api/logs?from=N`) |
+| `/update` | Install the latest release or switch build variant, boot the other app slot, upload a file |
+| `/settings` | Device and network options, admin password, reboot, factory reset |
 | `/setup` | Change Wi-Fi network (admin password once set) |
 | `/api/power` | Time spent active / idle / in light sleep |
 | `/api/wakes` | Received frames by kind: what keeps waking the radio (`?reset=1` clears) |
+
+Everything that changes the device needs the admin password (`X-Admin-Password` header in the API).
+A status banner appears when a newer release is known.
+
+## Settings
+
+**Device** (saved at once):
+
+| Option | |
+|---|---|
+| Hostname | mDNS name (`<name>.local`, immediately) and DHCP host name (router sees it after the next reconnect). Default `esp32` |
+| Time zone | POSIX TZ string (presets for common zones). The clock syncs from `pool.ntp.org` after connecting and every 6 h; log lines then carry local time |
+| LED | *Activity* (default: blink while connecting, flash per request), *On while connected*, or *Off*. The BOOT-button countdown always uses the LED |
+| Gateway check | Health-check interval, 30-3600 s (default 300) |
+| Daily update check | Off by default. Checks GitHub once a day and shows a banner; it never installs by itself |
+
+**Network** (*Apply and test*): DHCP or static IP (IP, netmask, gateway, DNS; an empty DNS keeps the
+server in use now), Wi-Fi TX power (2-20 dBm; the chip rounds to its nearest power step), and the
+power-save listen interval. Applying reconnects Wi-Fi and pings the gateway. If that doesn't work within
+30 s, the previous settings are restored by themselves and the page says why. As a second safety net,
+if the network later stays unreachable with a static IP or reduced TX power (Wi-Fi down 2 min, or the
+gateway fails three checks), the device goes back to DHCP and full power on its own and logs it.
+
+API: `GET/POST /api/config`, `GET/POST /api/net` (POST returns at once; poll GET for
+`testing` → `ok` / `reverted`), `POST /api/reboot`.
+
+**Reboot** is refused while new firmware is still on probation (about the first 30 s after an update),
+because a reset then would roll it back.
 
 ## OTA updates
 
@@ -74,6 +107,16 @@ previous one as "latest" for a few minutes.
 The repository is a build option (`idf.py menuconfig` → *App* → *GitHub repository for firmware
 updates*, empty disables it). API: `GET /api/update`, `POST /api/update/check`,
 `POST /api/update/install` (admin password).
+
+**Switching build variant:** every release has a default (low power) and a motion (CSI sensor) image,
+listed in its `manifest.json`. `/update` offers *Switch to the motion build* (or back); the switch
+works at any version, so it also lets you go to the other variant of the same release. API:
+`POST /api/update/install?variant=motion`.
+
+**Other app slot:** the board keeps the previous firmware in its second slot. `/update` lists both
+slots (version, build date, state) and *Boot …* switches to the other one. The switched-to image runs on
+probation like an update, so if it can't reach the network the board comes back by itself. API:
+`GET /api/slots`, `POST /api/slots/boot` (form `slot=ota_0`).
 
 **Upload a file from the browser:** open `/update`, choose `esp32-<version>-ota.bin` (from a release, or
 `firmware/build/esp32_status.bin` from your own build), enter the admin password, **Upload**. The page
@@ -103,7 +146,7 @@ truncated or corrupt files are rejected.
 - **Button:** hold **BOOT** for 20 s while the board is running. The LED blinks (faster in the last
   5 s), then stays on; releasing early cancels.
 
-Both erase Wi-Fi settings and the admin password and reboot into setup mode. Firmware is kept.
+Both erase Wi-Fi settings, the admin password and all options and reboot into setup mode. Firmware is kept.
 Holding BOOT *while* resetting or powering up enters the ROM download mode instead; that's normal.
 
 Forgot the admin password? Use the BOOT button, or erase the flash over USB and reflash.

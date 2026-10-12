@@ -4,6 +4,7 @@
 
 #include "esp_log.h"
 #include "nvs.h"
+#include "sdkconfig.h"
 
 #define NS "app"
 
@@ -18,9 +19,15 @@ static void load_str(nvs_handle_t h, const char *key, char *out, size_t len)
     }
 }
 
+static void set_defaults(void)
+{
+    s_set.led = LED_ACTIVITY;
+}
+
 void settings_load(void)
 {
     memset(&s_set, 0, sizeof(s_set));
+    set_defaults();
     nvs_handle_t h;
     if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) {
         return;  // namespace doesn't exist yet: unconfigured device
@@ -28,12 +35,92 @@ void settings_load(void)
     load_str(h, "ssid", s_set.ssid, sizeof(s_set.ssid));
     load_str(h, "pass", s_set.pass, sizeof(s_set.pass));
     load_str(h, "admin", s_set.admin, sizeof(s_set.admin));
+    load_str(h, "host", s_set.hostname, sizeof(s_set.hostname));
+    load_str(h, "tz", s_set.tz, sizeof(s_set.tz));
+    nvs_get_u8(h, "led", &s_set.led);
+    uint8_t b = 0;
+    nvs_get_u8(h, "autochk", &b);
+    s_set.auto_check = b;
+    nvs_get_u16(h, "health", &s_set.health_s);
+    nvs_get_u8(h, "listen", &s_set.listen);
+    nvs_get_u8(h, "txdbm", &s_set.tx_dbm);
+    nvs_get_u32(h, "ip", &s_set.ip);
+    nvs_get_u32(h, "mask", &s_set.mask);
+    nvs_get_u32(h, "gw", &s_set.gw);
+    nvs_get_u32(h, "dns", &s_set.dns);
     nvs_close(h);
 }
+
 
 const settings_t *settings(void)
 {
     return &s_set;
+}
+
+const char *settings_hostname(void)
+{
+    return s_set.hostname[0] ? s_set.hostname : SETTINGS_DEFAULT_HOSTNAME;
+}
+
+uint32_t settings_health_s(void)
+{
+    return s_set.health_s ? s_set.health_s : CONFIG_APP_HEALTH_INTERVAL_S;
+}
+
+int settings_listen(void)
+{
+#if CONFIG_APP_CSI_MOTION
+    return 0;  // power save is off in the motion build
+#else
+    return s_set.listen ? s_set.listen : CONFIG_APP_LISTEN_INTERVAL;
+#endif
+}
+
+int settings_tx_dbm(void)
+{
+    return s_set.tx_dbm ? s_set.tx_dbm : CONFIG_ESP_PHY_MAX_WIFI_TX_POWER;
+}
+
+void settings_set_options(const settings_t *opt)
+{
+    memcpy(s_set.hostname, opt->hostname, sizeof(s_set.hostname));
+    memcpy(s_set.tz, opt->tz, sizeof(s_set.tz));
+    s_set.led = opt->led;
+    s_set.auto_check = opt->auto_check;
+    s_set.health_s = opt->health_s;
+    s_set.listen = opt->listen;
+    s_set.tx_dbm = opt->tx_dbm;
+    s_set.ip = opt->ip;
+    s_set.mask = opt->mask;
+    s_set.gw = opt->gw;
+    s_set.dns = opt->dns;
+}
+
+esp_err_t settings_save_options(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    esp_err_t e[] = {
+        nvs_set_str(h, "host", s_set.hostname), nvs_set_str(h, "tz", s_set.tz),
+        nvs_set_u8(h, "led", s_set.led), nvs_set_u8(h, "autochk", s_set.auto_check),
+        nvs_set_u16(h, "health", s_set.health_s), nvs_set_u8(h, "listen", s_set.listen),
+        nvs_set_u8(h, "txdbm", s_set.tx_dbm), nvs_set_u32(h, "ip", s_set.ip),
+        nvs_set_u32(h, "mask", s_set.mask), nvs_set_u32(h, "gw", s_set.gw), nvs_set_u32(h, "dns", s_set.dns),
+    };
+    for (size_t i = 0; i < sizeof(e) / sizeof(e[0]) && err == ESP_OK; i++) {
+        err = e[i];
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "saving options failed: %s", esp_err_to_name(err));
+    }
+    return err;
 }
 
 bool settings_have_wifi(void)
@@ -101,6 +188,7 @@ esp_err_t settings_erase(void)
     }
     if (err == ESP_OK) {
         memset(&s_set, 0, sizeof(s_set));
+        set_defaults();
         ESP_LOGW(TAG, "all settings erased");
     }
     return err;

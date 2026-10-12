@@ -1,6 +1,9 @@
 // Push OTA over HTTP with automatic rollback.
 //   GET  /update    browser page: pick the .bin, enter the token, upload, watch confirm/rollback
 //   POST /api/ota   body = raw app image (build/esp32_status.bin), header X-Admin-Password
+//   GET  /api/slots       both app slots: version, build date, state, which one runs / boots next
+//   POST /api/slots/boot  form slot=<label>: boot the other slot's image (X-Admin-Password);
+//                         it runs on probation exactly like a fresh update
 //
 // A freshly flashed image boots "pending verify". The app must call ota_confirm() once it has
 // proven it works (Wi-Fi up and gateway reachable). If it isn't confirmed within

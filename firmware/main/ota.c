@@ -20,6 +20,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "httputil.h"
 #include "settings.h"
 
 #define CHUNK            4096
@@ -333,6 +334,101 @@ static esp_err_t ota_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ---------- app slots: GET /api/slots, POST /api/slots/boot ----------
+
+static const char *state_name(const esp_partition_t *p)
+{
+    esp_ota_img_states_t st;
+    if (esp_ota_get_state_partition(p, &st) != ESP_OK) {
+        return "unknown";
+    }
+    switch (st) {
+    case ESP_OTA_IMG_NEW: return "new";
+    case ESP_OTA_IMG_PENDING_VERIFY: return "probation";
+    case ESP_OTA_IMG_VALID: return "valid";
+    case ESP_OTA_IMG_INVALID: return "rolled back";
+    case ESP_OTA_IMG_ABORTED: return "aborted";
+    default: return "unknown";
+    }
+}
+
+// A slot we could boot: holds an app image for this project (full verification happens on switch).
+static bool slot_desc(const esp_partition_t *p, esp_app_desc_t *d)
+{
+    return esp_ota_get_partition_description(p, d) == ESP_OK &&
+           strncmp(d->project_name, esp_app_get_description()->project_name, sizeof(d->project_name)) == 0;
+}
+
+static esp_err_t slots_get(httpd_req_t *req)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_sendstr_chunk(req, "{\"slots\":[");
+    esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, NULL);
+    for (bool first = true; it; it = esp_partition_next(it), first = false) {
+        const esp_partition_t *p = esp_partition_get(it);
+        esp_app_desc_t d;
+        bool has = slot_desc(p, &d);
+        char version[48], item[256];
+        json_str(version, sizeof(version), has ? d.version : "");
+        snprintf(item, sizeof(item),
+                 "%s{\"label\":\"%s\",\"size\":%lu,\"app\":%s,\"version\":%s,\"built\":\"%s %s\","
+                 "\"state\":\"%s\",\"running\":%s,\"boot\":%s}",
+                 first ? "" : ",", p->label, (unsigned long)p->size, has ? "true" : "false", version,
+                 has ? d.date : "", has ? d.time : "", has ? state_name(p) : "empty",
+                 p == running ? "true" : "false", p == boot ? "true" : "false");
+        httpd_resp_sendstr_chunk(req, item);
+    }
+    esp_partition_iterator_release(it);
+    httpd_resp_sendstr_chunk(req, s_pending ? "],\"probation\":true}" : "],\"probation\":false}");
+    return httpd_resp_sendstr_chunk(req, NULL);
+}
+
+// POST /api/slots/boot  form: slot=<label>. Boots the other image; like an update, it starts on
+// probation (the bootloader marks the slot NEW) and falls back here if it can't confirm.
+static esp_err_t slot_boot_post(httpd_req_t *req)
+{
+    if (!settings_require_admin(req)) {
+        return ESP_OK;
+    }
+    char *body = http_read_body(req);
+    char label[17];
+    bool ok = body && http_form_field(body, "slot", label, sizeof(label), NULL);
+    http_free_body(body);
+    const esp_partition_t *p = ok ? esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, label) : NULL;
+    esp_app_desc_t d;
+    if (!p) {
+        return http_send_text(req, "400 Bad Request", "no such slot\n");
+    }
+    if (p == esp_ota_get_running_partition()) {
+        return http_send_text(req, "400 Bad Request", "that slot is already running\n");
+    }
+    if (!slot_desc(p, &d)) {
+        return http_send_text(req, "400 Bad Request", "that slot holds no firmware for this device\n");
+    }
+    if (s_pending) {
+        return http_send_text(req, "409 Conflict", "running firmware not confirmed yet; wait a minute and retry\n");
+    }
+    if (s_w.active) {
+        return http_send_text(req, "409 Conflict", "an update is in progress\n");
+    }
+    esp_err_t err = esp_ota_set_boot_partition(p);  // verifies the whole image first
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "cannot boot %s: %s", p->label, esp_err_to_name(err));
+        return http_send_text(req, "400 Bad Request", err == ESP_ERR_OTA_VALIDATE_FAILED
+                                                          ? "the image in that slot is corrupt\n"
+                                                          : "could not switch\n");
+    }
+    ESP_LOGW(TAG, "switching to %s (%s) on request, rebooting", p->label, d.version);
+    char msg[96];
+    snprintf(msg, sizeof(msg), "ok: rebooting into %s (%s)\n", d.version, p->label);
+    http_send_text(req, "200 OK", msg);
+    ota_reboot();
+    return ESP_OK;
+}
+
 void ota_register(httpd_handle_t server)
 {
     ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "ota", &s_no_sleep));
@@ -341,4 +437,8 @@ void ota_register(httpd_handle_t server)
     httpd_register_uri_handler(server, &uri);
     const httpd_uri_t page = { .uri = "/update", .method = HTTP_GET, .handler = update_page_get };
     httpd_register_uri_handler(server, &page);
+    const httpd_uri_t slots = { .uri = "/api/slots", .method = HTTP_GET, .handler = slots_get };
+    httpd_register_uri_handler(server, &slots);
+    const httpd_uri_t boot = { .uri = "/api/slots/boot", .method = HTTP_POST, .handler = slot_boot_post };
+    httpd_register_uri_handler(server, &boot);
 }

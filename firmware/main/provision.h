@@ -43,6 +43,3 @@ void prov_register(httpd_handle_t server);
 
 // Erase all settings and reboot into setup mode now (BOOT-button reset). Does not return.
 void prov_factory_reset(void);
-
-// Write s as a JSON string literal (with quotes) into out. Returns length written.
-size_t prov_json_str(char *out, size_t len, const char *s);

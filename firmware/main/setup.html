@@ -116,7 +116,7 @@ function poll(t0) {
       return poll(t0);
     }
     if (s.state === 'ok') {
-      msg(`Connected to "${s.trial_ssid}" and saved.\n\nThe device is rebooting. Switch your phone back to "${s.trial_ssid}", then open:\n  http://${s.ip}/\n  http://esp32.local/`, 'ok');
+      msg(`Connected to "${s.trial_ssid}" and saved.\n\nThe device is rebooting. Switch your phone back to "${s.trial_ssid}", then open:\n  http://${s.ip}/\n  http://${s.hostname}.local/`, 'ok');
     } else if (s.state === 'failed') {
       msg(`Could not connect: ${s.msg}. Check and try again.`, 'err');
       $('go').disabled = false;

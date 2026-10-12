@@ -2,82 +2,213 @@
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32 settings</title>
-<style>
-body{font-family:system-ui,sans-serif;margin:2em;max-width:30em}
-td{padding:.25em 1em .25em 0}td:first-child{color:#666}
-h3{margin-top:1.8em}
-label{display:block;margin:.8em 0 .3em}
-input[type=password]{width:100%;box-sizing:border-box;padding:.45em}
-button{margin-top:1em;padding:.5em 1.2em}
-.danger{background:#c00;color:#fff;border:0;border-radius:4px}
-.hint{color:#666;font-size:.9em}
-.ok{color:#080}.err{color:#c00}
-p[id$=msg]{white-space:pre-wrap}
-</style></head>
+<link rel="stylesheet" href="/app.css">
+</head>
 <body>
 <h2>Settings</h2>
+
+<div class="box" id="pwbox">
+  <label for="pw">Admin password <span class="hint">(needed to save anything on this page)</span></label>
+  <input id="pw" type="password" autocomplete="current-password">
+  <label class="inline"><input id="remember" type="checkbox"> remember in this browser</label>
+</div>
+<p id="noadmin" class="banner" hidden>No admin password is set yet: set one below first.</p>
+
+<h3>Device</h3>
+<form id="dev">
+  <label for="hostname">Hostname <span class="hint">(<span id="hn-ex">esp32</span>.local; the router sees it after the next reconnect)</span></label>
+  <input id="hostname" type="text" maxlength="32" pattern="[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?">
+  <label for="tzsel">Time zone</label>
+  <div class="row">
+    <select id="tzsel"></select>
+    <input id="tz" type="text" maxlength="47" placeholder="POSIX TZ, e.g. IST-5:30">
+  </div>
+  <p class="hint">Clock synced from pool.ntp.org every few hours. <a href="#" id="tzguess">Use this browser's offset</a> (no daylight saving).</p>
+  <label for="led">LED</label>
+  <select id="led">
+    <option value="1">Activity: blink while connecting, flash per request</option>
+    <option value="2">On while connected</option>
+    <option value="0">Off</option>
+  </select>
+  <label for="health_s">Gateway check every (seconds) <span class="hint">30-3600</span></label>
+  <input id="health_s" type="number" min="30" max="3600">
+  <label class="inline" style="display:block;margin-top:1em"><input id="auto_check" type="checkbox"> Check GitHub for new firmware once a day <span class="hint">(only reports; never installs by itself)</span></label>
+  <button type="submit">Save</button>
+</form>
+<p id="dev-msg" class="msg"></p>
+
+<h3>Network</h3>
 <table id="cur"></table>
+<p class="hint">Wi-Fi network: <a href="/setup">change network</a> (the new one is tested before it replaces the current one).</p>
+<form id="net">
+  <label class="inline"><input type="radio" name="ipmode" value="dhcp" checked> DHCP</label>
+  <label class="inline"><input type="radio" name="ipmode" value="static"> Static IP</label>
+  <div id="static" hidden>
+    <div class="row">
+      <div><label for="ip">IP address</label><input id="ip" type="text" placeholder="192.168.1.50"></div>
+      <div><label for="mask">Netmask</label><input id="mask" type="text" placeholder="255.255.255.0"></div>
+    </div>
+    <div class="row">
+      <div><label for="gw">Gateway</label><input id="gw" type="text" placeholder="192.168.1.1"></div>
+      <div><label for="dns">DNS <span class="hint">(empty: keep current)</span></label><input id="dns" type="text"></div>
+    </div>
+  </div>
+  <div class="row">
+    <div id="listen-w"><label for="listen">Power save: wake every N beacons</label><select id="listen"></select></div>
+    <div><label for="tx_dbm">Max TX power</label><select id="tx_dbm"></select></div>
+  </div>
+  <p class="hint">Applying reconnects Wi-Fi and checks the gateway. If that fails within 30 s, the previous
+  settings come back by themselves. Lower TX power saves energy when the router is close.</p>
+  <button type="submit">Apply and test</button>
+</form>
+<p id="net-msg" class="msg"></p>
 
-<h3>Wi-Fi network</h3>
-<p class="hint">To switch networks, use the <a href="/setup">setup page</a>. The new network is tested before it replaces the current one.</p>
-
-<h3 id="adm-h">Admin password</h3>
-<p class="hint" id="adm-hint">Protects firmware updates, Wi-Fi changes and reset.</p>
+<h3 id="adm-h">Change admin password</h3>
 <form id="adm">
-  <div id="adm-cur-w"><label for="adm-cur">Current admin password</label><input id="adm-cur" type="password"></div>
-  <label for="adm-new">New admin password (8+ characters)</label><input id="adm-new" type="password" maxlength="64">
-  <label for="adm-new2">Repeat new password</label><input id="adm-new2" type="password" maxlength="64">
+  <div class="row">
+    <div><label for="adm-new">New password (8+ characters)</label><input id="adm-new" type="password" maxlength="64" autocomplete="new-password"></div>
+    <div><label for="adm-new2">Repeat</label><input id="adm-new2" type="password" maxlength="64" autocomplete="new-password"></div>
+  </div>
   <button type="submit">Save admin password</button>
 </form>
-<p id="adm-msg"></p>
+<p id="adm-msg" class="msg"></p>
 
-<h3>Factory reset</h3>
-<p class="hint">Forgets the Wi-Fi network and the admin password, then reboots into setup mode: the device
-opens the network <b>ESP32-Setup-XXXX</b> (WPA3, password <b>esp32setupXXXX</b>, same XXXX) until it is
-configured again. Firmware is kept.</p>
-<form id="rst">
-  <label for="rst-pw">Admin password</label><input id="rst-pw" type="password">
-  <button type="submit" class="danger">Reset to setup mode</button>
-</form>
-<p id="rst-msg"></p>
+<h3>Maintenance</h3>
+<button id="reboot">Reboot</button>
+<p id="reboot-msg" class="msg"></p>
+<p class="hint"><b>Factory reset</b> forgets the Wi-Fi network, the admin password and all settings on this page,
+then reboots into setup mode: the device opens <b>ESP32-Setup-XXXX</b> (WPA3, password <b>esp32setupXXXX</b>,
+same XXXX). Firmware is kept. Holding BOOT for 20 s does the same.</p>
+<button id="reset" class="danger">Factory reset</button>
+<p id="rst-msg" class="msg"></p>
 
-<p><a href="/">Status</a> · <a href="/update">Firmware update</a></p>
-
+<script src="/app.js"></script>
 <script>
-const $ = id => document.getElementById(id);
-const say = (id, t, c) => { $(id).textContent = t; $(id).className = c || ''; };
+const ZONES = [
+  ['UTC', 'UTC0'], ['London', 'GMT0BST,M3.5.0/1,M10.5.0'], ['Central Europe', 'CET-1CEST,M3.5.0,M10.5.0/3'],
+  ['Eastern Europe', 'EET-2EEST,M3.5.0/3,M10.5.0/4'], ['Moscow', 'MSK-3'], ['Dubai', '<+04>-4'],
+  ['Pakistan', 'PKT-5'], ['India', 'IST-5:30'], ['Nepal', '<+0545>-5:45'], ['Bangladesh', '<+06>-6'],
+  ['Thailand, Vietnam', '<+07>-7'], ['China, Singapore', 'CST-8'], ['Japan, Korea', 'JST-9'],
+  ['Sydney', 'AEST-10AEDT,M10.1.0,M4.1.0/3'], ['New Zealand', 'NZST-12NZDT,M9.5.0,M4.1.0/3'],
+  ['US Eastern', 'EST5EDT,M3.2.0,M11.1.0'], ['US Central', 'CST6CDT,M3.2.0,M11.1.0'],
+  ['US Mountain', 'MST7MDT,M3.2.0,M11.1.0'], ['Arizona', 'MST7'], ['US Pacific', 'PST8PDT,M3.2.0,M11.1.0'],
+  ['Brazil (São Paulo)', '<-03>3'],
+];
 let adminSet = true;
 
-Promise.all([fetch('/api/status').then(r => r.json()), fetch('/api/setup').then(r => r.json())]).then(([s, p]) => {
-  const rows = [['network', p.ssid || '(none)'], ['IP', s.ip], ['signal', s.rssi_dbm + ' dBm'], ['firmware', s.firmware]];
-  $('cur').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td></td></tr>`).join('');
-  [...$('cur').querySelectorAll('td:last-child')].forEach((td, i) => td.textContent = rows[i][1]);
+function fillSelect(sel, list) {
+  sel.innerHTML = '';
+  for (const [text, value] of list) { const o = document.createElement('option'); o.textContent = text; o.value = value; sel.appendChild(o); }
+}
+fillSelect($('tzsel'), [['Custom…', ''], ...ZONES.map(([n, v]) => [`${n} (${v.split(/[,]/)[0]})`, v])]);
+const syncTz = () => { $('tzsel').value = ZONES.some(z => z[1] === $('tz').value) ? $('tz').value : ''; };
+$('tzsel').onchange = () => { if ($('tzsel').value) $('tz').value = $('tzsel').value; };
+$('tz').oninput = syncTz;
+$('tzguess').onclick = ev => {
+  ev.preventDefault();
+  const off = -new Date().getTimezoneOffset(), a = Math.abs(off);  // minutes east of UTC
+  const hm = `${Math.floor(a / 60)}${a % 60 ? ':' + String(a % 60).padStart(2, '0') : ''}`;
+  const name = `<${off < 0 ? '-' : '+'}${String(Math.floor(a / 60)).padStart(2, '0')}${a % 60 ? String(a % 60).padStart(2, '0') : ''}>`;
+  $('tz').value = off ? `${name}${off > 0 ? '-' : ''}${hm}` : 'UTC0';  // POSIX sign is inverted
+  syncTz();
+};
+$('hostname').oninput = () => { $('hn-ex').textContent = $('hostname').value || 'esp32'; };
+const showStatic = () => { $('static').hidden = document.querySelector('[name=ipmode]:checked').value !== 'static'; };
+document.querySelectorAll('[name=ipmode]').forEach(r => r.onchange = showStatic);
+
+async function load() {
+  const [c, s, p] = await Promise.all([getJSON('/api/config'), getJSON('/api/status'), getJSON('/api/setup')]);
+  $('hostname').value = c.hostname; $('hn-ex').textContent = c.hostname;
+  $('tz').value = c.tz; syncTz();
+  $('led').value = c.led;
+  $('health_s').value = c.health_s;
+  $('auto_check').checked = c.auto_check;
+  if (!c.update_repo) $('auto_check').disabled = true;
+  fillSelect($('listen'), [...Array(10)].map((_, i) => [`${i + 1} (${(i + 1) * 102} ms)${i + 1 === c.defaults.listen ? ', default' : ''}`, i + 1]));
+  fillSelect($('tx_dbm'), [20, 17, 15, 13, 11, 8, 5, 2].map(d => [`${d} dBm${d === c.defaults.tx_dbm ? ' (default, full)' : ''}`, d]));
+  $('listen').value = c.listen; $('tx_dbm').value = c.tx_dbm;
+  $('listen-w').hidden = !c.power_save;
+  document.querySelector(`[name=ipmode][value=${c.ip ? 'static' : 'dhcp'}]`).checked = true;
+  for (const k of ['ip', 'mask', 'gw', 'dns']) $(k).value = c[k];
+  if (!c.ip && s.ip) { $('ip').placeholder = s.ip; $('dns').placeholder = s.dns; }
+  showStatic();
+  rows($('cur'), [['Wi-Fi', p.ssid || '(none)'], ['IP address', s.ip ? `${s.ip} (${s.ip_mode === 'static' ? 'static' : 'DHCP'})` : null],
+                  ['DNS', s.dns || null], ['signal', s.rssi_dbm !== null ? `${s.rssi_dbm} dBm` : null],
+                  ['TX power', `${s.tx_power_dbm} dBm max`]]);
   adminSet = p.admin_set;
-  if (!adminSet) {
-    $('adm-cur-w').hidden = true;
-    $('adm-h').textContent = 'Set an admin password';
-    $('adm-hint').textContent = 'No admin password is set yet: firmware updates and reset are disabled until you set one.';
-    $('adm-hint').className = 'err';
+  $('noadmin').hidden = adminSet;
+  $('pwbox').hidden = !adminSet;
+  $('adm-h').textContent = adminSet ? 'Change admin password' : 'Set an admin password';
+}
+load().catch(() => {});
+
+$('dev').onsubmit = async ev => {
+  ev.preventDefault();
+  const pw = adminPw('dev-msg'); if (!pw) return;
+  const r = await post('/api/config', { hostname: $('hostname').value.trim(), tz: $('tz').value.trim(), led: $('led').value,
+                                        health_s: $('health_s').value, auto_check: $('auto_check').checked ? 1 : 0 }, pw);
+  say('dev-msg', (await r.text()).trim(), r.ok ? 'ok' : 'err');
+  if (r.ok) load();
+};
+
+$('net').onsubmit = async ev => {
+  ev.preventDefault();
+  const pw = adminPw('net-msg'); if (!pw) return;
+  const isStatic = document.querySelector('[name=ipmode]:checked').value === 'static';
+  const f = { listen: $('listen').value, tx_dbm: $('tx_dbm').value, ip: '', mask: '', gw: '', dns: '' };
+  if (isStatic) for (const k of ['ip', 'mask', 'gw', 'dns']) f[k] = $(k).value.trim();
+  if (isStatic && !f.ip) return say('net-msg', 'Enter the static IP address.', 'err');
+  const r = await post('/api/net', f, pw);
+  if (r.status !== 202) return say('net-msg', (await r.text()).trim(), 'err');
+  // If the IP changes, this page loses the device: point to the new address.
+  const moved = isStatic && f.ip !== location.hostname && /^[\d.]+$/.test(location.hostname);
+  const t0 = Date.now();
+  for (;;) {
+    await sleep(2000);
+    const secs = Math.round((Date.now() - t0) / 1000);
+    let t;
+    try { t = await getJSON('/api/net'); } catch (e) {
+      say('net-msg', moved ? `Reconnecting... the device moves to http://${f.ip}/ if the test passes (${secs} s)` : `Reconnecting... ${secs} s`, 'warn');
+      if (secs > 90) return say('net-msg', `Lost contact. Try http://${f.ip || location.hostname}/`, 'err');
+      continue;
+    }
+    if (t.state === 'ok') { say('net-msg', 'Done: ' + t.msg, 'ok'); return load(); }
+    if (t.state === 'reverted') { say('net-msg', 'Not applied: ' + t.msg, 'err'); return load(); }
+    say('net-msg', `Testing new settings... ${secs} s`, 'warn');
   }
-}).catch(() => {});
+};
 
 $('adm').onsubmit = async ev => {
   ev.preventDefault();
   const n = $('adm-new').value;
   if (n.length < 8) return say('adm-msg', 'At least 8 characters.', 'err');
   if (n !== $('adm-new2').value) return say('adm-msg', 'Passwords do not match.', 'err');
-  const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
-  if (adminSet) headers['X-Admin-Password'] = $('adm-cur').value;
-  const r = await fetch('/api/admin', { method: 'POST', headers, body: new URLSearchParams({ new: n }) });
-  say('adm-msg', await r.text(), r.ok ? 'ok' : 'err');
-  if (r.ok) { adminSet = true; $('adm-cur-w').hidden = false; $('adm').reset(); }
+  let pw = null;
+  if (adminSet && !(pw = adminPw('adm-msg'))) return;
+  const r = await post('/api/admin', { new: n }, pw);
+  say('adm-msg', (await r.text()).trim(), r.ok ? 'ok' : 'err');
+  if (r.ok) {
+    $('adm').reset();
+    $('pw').value = n;
+    try { if (localStorage.getItem('admin_pw')) localStorage.setItem('admin_pw', n); } catch (e) {}
+    load();
+  }
 };
 
-$('rst').onsubmit = async ev => {
-  ev.preventDefault();
-  if (!confirm('Erase Wi-Fi settings and admin password, and reboot into setup mode?')) return;
-  const r = await fetch('/api/reset', { method: 'POST', headers: { 'X-Admin-Password': $('rst-pw').value } });
-  say('rst-msg', r.ok ? 'Settings erased. The device is rebooting into setup mode:\njoin "ESP32-Setup-XXXX" (password esp32setupXXXX) to configure it again.' : await r.text(), r.ok ? 'ok' : 'err');
+$('reboot').onclick = async () => {
+  const pw = adminPw('reboot-msg'); if (!pw) return;
+  if (!confirm('Reboot the device now?')) return;
+  const r = await post('/api/reboot', {}, pw);
+  if (!r.ok) return say('reboot-msg', (await r.text()).trim(), 'err');
+  say('reboot-msg', 'Rebooting...', 'warn');
+  waitReboot('reboot-msg', s => say('reboot-msg', `Back up: ${s.firmware} on ${s.partition}, last reset: ${s.reset_reason}.`, 'ok'));
+};
+
+$('reset').onclick = async () => {
+  const pw = adminPw('rst-msg'); if (!pw) return;
+  if (!confirm('Erase Wi-Fi, admin password and all settings, and reboot into setup mode?')) return;
+  const r = await post('/api/reset', {}, pw);
+  say('rst-msg', r.ok ? 'Settings erased. The device is rebooting into setup mode:\njoin "ESP32-Setup-XXXX" (password esp32setupXXXX) to configure it again.' : (await r.text()).trim(), r.ok ? 'ok' : 'err');
 };
 </script>
 </body></html>

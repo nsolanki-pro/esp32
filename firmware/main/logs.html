@@ -1,0 +1,49 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 log</title>
+<link rel="stylesheet" href="/app.css">
+<style>body{max-width:60em}pre{max-height:75vh;min-height:20em}</style>
+</head>
+<body>
+<h2>Log</h2>
+<p class="hint">The last 8 KB of the device log, updating live. Times are local once the clock has synced.</p>
+<pre id="log"></pre>
+<button id="pause">Pause</button><button id="clear">Clear view</button><button id="save">Download</button>
+<span id="st" class="hint"></span>
+
+<script src="/app.js"></script>
+<script>
+let next = 0, paused = false, text = '';
+const pre = $('log');
+
+async function poll() {
+  if (!paused) {
+    try {
+      const r = await fetch('/api/logs?from=' + next, { cache: 'no-store' });
+      const n = +r.headers.get('X-Log-Next');
+      const chunk = await r.text();
+      if (n < next) text += '\n----- device restarted -----\n';
+      next = n;
+      if (chunk) {
+        const atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
+        text = (text + chunk).slice(-200000);
+        pre.textContent = text;
+        if (atEnd) pre.scrollTop = pre.scrollHeight;
+      }
+      $('st').textContent = '';
+    } catch (e) { $('st').textContent = 'device not reachable, retrying...'; }
+  }
+  setTimeout(poll, 2000);
+}
+$('pause').onclick = () => { paused = !paused; $('pause').textContent = paused ? 'Resume' : 'Pause'; };
+$('clear').onclick = () => { text = ''; pre.textContent = ''; };
+$('save').onclick = () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+  a.download = 'esp32-log.txt';
+  a.click();
+};
+poll();
+</script>
+</body></html>

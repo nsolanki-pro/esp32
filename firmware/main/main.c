@@ -3,7 +3,7 @@
 //   GET /api/status  JSON status
 //   GET /api/power   power-management stats (time spent active / idle / light sleep)
 //   GET /api/wakes   received-frame counters by kind, i.e. what wakes the radio (?reset=1 clears)
-//   GET /update      firmware upload page (browser)
+//   GET /update      firmware update page; /logs live log; /settings device settings (web.c)
 //   GET /setup, /settings and their APIs: see provision.h
 //   GET /api/update, POST /api/update/{check,install}: install the latest GitHub release (update.h)
 //   POST /api/ota    firmware update (see ota.h; or use ../ota.sh)
@@ -24,18 +24,29 @@
 // provision.h), and the same AP comes back if the stored network stays unreachable for
 // FALLBACK_AP_S. OTA only replaces the app, so settings survive updates.
 // Factory reset: web UI (/settings), or hold the BOOT button for BUTTON_RESET_S while running.
-// Logs go to UART0 at 115200.
+// Logs go to UART0 at 115200, and the last 8 KB can be read at /logs (logbuf.h).
+//
+// Network options (static IP, Wi-Fi transmit power, listen interval) are applied with a test: the
+// link is reconnected and must reach the gateway within NET_TEST_S, otherwise the previous options
+// are restored. Later, if the network stays unreachable with custom options, they are reset to the
+// defaults (DHCP, full power) before the usual escalation, so a bad setting can't lock the device out.
 
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include "driver/gpio.h"
+#include "esp_chip_info.h"
 #include "esp_event.h"
+#include "esp_flash.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_pm.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
@@ -47,9 +58,13 @@
 #include "freertos/task.h"
 #include "mdns.h"
 #include "nvs_flash.h"
+#include "app.h"
+#include "httputil.h"
+#include "logbuf.h"
 #include "ota.h"
 #include "provision.h"
 #include "update.h"
+#include "web.h"
 #include "lwip/ip_addr.h"
 #include "ping/ping_sock.h"
 #include "rxstats.h"
@@ -60,7 +75,6 @@
 #include "motion.h"
 #endif
 
-#define HOSTNAME       "esp32"
 // On-board LED: slow blink = connecting. Low-power build: off when idle, short flash per HTTP
 // request. Motion build: solid when connected, fast blink on motion.
 #define LED_GPIO       GPIO_NUM_2
@@ -77,9 +91,12 @@
 #define HEALTH_RETRY_S        30   // recheck interval while failing or disconnected
 #define DOWN_RESTART_WIFI_S   300  // Wi-Fi down this long -> restart the Wi-Fi driver (once per outage)
 #define FALLBACK_AP_S         120  // Wi-Fi down this long -> also open the setup AP
+#define NET_TEST_S            30   // new network options must reach the gateway within this
+#define NTP_SERVER            "pool.ntp.org"
 
 #define CONNECTED_BIT     BIT0
 #define DISCONNECTED_BIT  BIT1
+#define LED_KICK_BIT      BIT2  // LED mode changed: re-evaluate
 
 static const char *TAG = "app";
 
@@ -100,7 +117,9 @@ static bool s_gw_checked;
 static uint32_t s_gw_fails;
 static uint32_t s_gw_rtt_ms;
 static int64_t s_gw_last_check_us;
-static uint32_t s_act_reconnects, s_act_wifi_restarts;
+static uint32_t s_act_reconnects, s_act_wifi_restarts, s_act_net_reverts;
+static bool s_sntp_started;
+static bool s_time_synced;
 
 // ---------- Wi-Fi ----------
 
@@ -156,6 +175,50 @@ static void resume_sta(void)
 }
 
 static void wifi_apply_ps(void);
+static void net_apply_ip(void);
+static void net_apply_dns(void);
+
+// ---------- clock ----------
+
+static void time_synced_cb(struct timeval *tv)
+{
+    bool first = !s_time_synced;
+    s_time_synced = true;
+    if (first) {
+        char now[32];
+        app_time_str(now, sizeof(now));
+        ESP_LOGI(TAG, "Time: synced with " NTP_SERVER ", %s", now);
+    }
+}
+
+// One request now, then every CONFIG_LWIP_SNTP_UPDATE_DELAY (a few hours): negligible power.
+static void sntp_start(void)
+{
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(NTP_SERVER);
+    cfg.sync_cb = time_synced_cb;
+    if (esp_netif_sntp_init(&cfg) != ESP_OK) {
+        ESP_LOGW(TAG, "Time: SNTP init failed");
+    }
+}
+
+void app_apply_tz(void)
+{
+    setenv("TZ", settings()->tz[0] ? settings()->tz : "UTC0", 1);
+    tzset();
+}
+
+bool app_time_str(char *buf, size_t len)
+{
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    if (!s_time_synced) {
+        snprintf(buf, len, "not synced");
+        return false;
+    }
+    strftime(buf, len, "%Y-%m-%d %H:%M:%S %Z", &tm);
+    return true;
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -163,6 +226,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         return;  // belongs to a setup attempt
     }
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_set_max_tx_power(settings_tx_dbm() * 4);  // unit 0.25 dBm; reset by a driver restart
         start_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *ev = data;
@@ -189,6 +253,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         esp_timer_stop(s_retry_timer);
         s_down_since_us = 0;
         s_gw = ev->ip_info.gw;
+        net_apply_dns();
         xEventGroupClearBits(s_wifi_events, DISCONNECTED_BIT);
         xEventGroupSetBits(s_wifi_events, CONNECTED_BIT);
         rxstats_install(s_netif);
@@ -198,7 +263,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         }
         ESP_LOGI(TAG, "Wi-Fi: connected in %lld ms, IP " IPSTR ", RSSI %d dBm",
                  (esp_timer_get_time() - s_connect_start_us) / 1000, IP2STR(&ev->ip_info.ip), rssi);
-        ESP_LOGI(TAG, "HTTP: http://" IPSTR "/  or  http://" HOSTNAME ".local/", IP2STR(&ev->ip_info.ip));
+        ESP_LOGI(TAG, "HTTP: http://" IPSTR "/  or  http://%s.local/", IP2STR(&ev->ip_info.ip), settings_hostname());
+        if (!s_sntp_started) {
+            s_sntp_started = true;
+            sntp_start();
+        }
 #if CONFIG_APP_CSI_MOTION
         motion_on_connected(ev->ip_info.gw);
 #endif
@@ -225,7 +294,8 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     s_netif = esp_netif_create_default_wifi_sta();
-    ESP_ERROR_CHECK(esp_netif_set_hostname(s_netif, HOSTNAME));
+    ESP_ERROR_CHECK(esp_netif_set_hostname(s_netif, settings_hostname()));
+    net_apply_ip();  // static IP, if configured (TX power and listen interval need the driver)
 
     prov_init(resume_sta);
 
@@ -265,6 +335,7 @@ static void wifi_init(void)
 // ---------- Health check ----------
 
 static SemaphoreHandle_t s_ping_done;
+static SemaphoreHandle_t s_ping_lock;  // the health check and the network test both ping
 static uint32_t s_ping_rtt_sum;
 
 static void ping_success_cb(esp_ping_handle_t hdl, void *arg)
@@ -289,7 +360,9 @@ static uint32_t ping_gateway(uint32_t *avg_rtt_ms)
     ip_addr_set_ip4_u32(&cfg.target_addr, s_gw.addr);  // works with or without IPv6
     esp_ping_callbacks_t cbs = { .on_ping_success = ping_success_cb, .on_ping_end = ping_end_cb };
     esp_ping_handle_t hdl;
+    xSemaphoreTake(s_ping_lock, portMAX_DELAY);
     if (esp_ping_new_session(&cfg, &cbs, &hdl) != ESP_OK) {
+        xSemaphoreGive(s_ping_lock);
         return 0;
     }
     s_ping_rtt_sum = 0;
@@ -298,6 +371,7 @@ static uint32_t ping_gateway(uint32_t *avg_rtt_ms)
     xSemaphoreTake(s_ping_done, pdMS_TO_TICKS(10000));
     uint32_t replies = 0;
     esp_ping_get_profile(hdl, ESP_PING_PROF_REPLY, &replies, sizeof(replies));
+    xSemaphoreGive(s_ping_lock);
     esp_ping_stop(hdl);
     esp_ping_delete_session(hdl);
     *avg_rtt_ms = replies ? s_ping_rtt_sum / replies : 0;
@@ -323,19 +397,173 @@ static void restart_wifi_driver(void)
     wifi_apply_ps();
 }
 
+// ---------- network options: apply, test, keep or revert ----------
+
+typedef enum { NT_IDLE, NT_TESTING, NT_OK, NT_REVERTED } net_test_t;
+static const char *const NT_NAMES[] = { "idle", "testing", "ok", "reverted" };
+static volatile net_test_t s_nt;
+static char s_nt_msg[96];
+static settings_t s_nt_next;
+
+// Static IP: the DNS server is cleared again when the interface goes down/up, so this is also
+// called on every GOT_IP.
+static void net_apply_dns(void)
+{
+    const settings_t *s = settings();
+    if (s->ip) {
+        esp_netif_dns_info_t dns = { .ip.type = ESP_IPADDR_TYPE_V4 };
+        dns.ip.u_addr.ip4.addr = s->dns ? s->dns : s->gw;
+        esp_netif_set_dns_info(s_netif, ESP_NETIF_DNS_MAIN, &dns);
+    }
+}
+
+static void net_apply_ip(void)
+{
+    const settings_t *s = settings();
+    if (s->ip) {
+        esp_netif_dhcpc_stop(s_netif);
+        esp_netif_ip_info_t ip = { .ip.addr = s->ip, .netmask.addr = s->mask, .gw.addr = s->gw };
+        esp_netif_set_ip_info(s_netif, &ip);
+        net_apply_dns();
+    } else {
+        esp_netif_dhcpc_start(s_netif);  // "already started" is fine
+    }
+}
+
+// Push all network options from settings() to the driver and netif. Call while disconnected.
+static void net_apply(void)
+{
+    esp_wifi_set_max_tx_power(settings_tx_dbm() * 4);
+    if (settings_have_wifi()) {
+        prov_set_sta(settings()->ssid, settings()->pass);  // carries the listen interval
+    }
+    net_apply_ip();
+}
+
+// Drop the link, apply the current options, and connect again.
+static void net_reconnect(void)
+{
+    esp_timer_stop(s_retry_timer);
+    esp_wifi_disconnect();
+    xEventGroupWaitBits(s_wifi_events, DISCONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(3000));
+    vTaskDelay(pdMS_TO_TICKS(200));  // netif goes down in the same event: then IP changes are quiet
+    net_apply();
+    resume_sta();
+}
+
+static bool net_custom(void)
+{
+    return settings()->ip || settings()->tx_dbm;
+}
+
+// Network unreachable with custom options: go back to DHCP and full power, persistently.
+static bool net_revert_custom(const char *why)
+{
+    if (!net_custom() || s_nt == NT_TESTING) {
+        return false;
+    }
+    ESP_LOGE(TAG, "Net: %s with custom network options: back to DHCP and default TX power", why);
+    settings_t def = *settings();
+    def.ip = def.mask = def.gw = def.dns = 0;
+    def.tx_dbm = 0;
+    settings_set_options(&def);
+    settings_save_options();
+    s_act_net_reverts++;
+    net_reconnect();
+    return true;
+}
+
+static void net_test_task(void *arg)
+{
+    settings_t prev = *settings();
+    vTaskDelay(pdMS_TO_TICKS(300));  // let the HTTP reply out before the link drops
+    settings_set_options(&s_nt_next);
+    ESP_LOGW(TAG, "Net: trying TX %d dBm, listen interval %d, %s", settings_tx_dbm(), settings_listen(),
+             settings()->ip ? "static IP" : "DHCP");
+    net_reconnect();
+
+    const char *err = NULL;
+    uint32_t rtt = 0;
+    if (!(xEventGroupWaitBits(s_wifi_events, CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(NET_TEST_S * 1000)) &
+          CONNECTED_BIT)) {
+        err = "could not connect to the access point";
+    } else if (ping_gateway(&rtt) == 0) {
+        err = "connected, but the gateway did not answer";
+    } else if (settings_save_options() != ESP_OK) {
+        err = "could not save to flash";
+    }
+    if (err) {
+        ESP_LOGE(TAG, "Net: new options failed (%s), restoring the previous ones", err);
+        snprintf(s_nt_msg, sizeof(s_nt_msg), "%s: previous settings restored", err);
+        settings_set_options(&prev);
+        net_reconnect();
+        s_nt = NT_REVERTED;
+    } else {
+        wifi_ap_record_t ap;
+        int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
+        snprintf(s_nt_msg, sizeof(s_nt_msg), "connected (RSSI %d dBm, gateway %" PRIu32 " ms): saved", rssi, rtt);
+        ESP_LOGI(TAG, "Net: new options work, %s", s_nt_msg);
+        s_nt = NT_OK;
+    }
+    vTaskDelete(NULL);
+}
+
+const char *app_net_test(const settings_t *next)
+{
+    if (s_nt == NT_TESTING) {
+        return "a network test is already running";
+    }
+    if (!settings_have_wifi() || prov_ap_active() || prov_trial_active()) {
+        return "not connected to the stored network";
+    }
+    s_nt_next = *next;
+    s_nt = NT_TESTING;
+    s_nt_msg[0] = '\0';
+    if (xTaskCreate(net_test_task, "net_test", 3072, NULL, 4, NULL) != pdPASS) {
+        s_nt = NT_IDLE;
+        return "out of memory";
+    }
+    return NULL;
+}
+
+bool app_net_testing(void)
+{
+    return s_nt == NT_TESTING;
+}
+
+size_t app_net_test_json(char *buf, size_t len)
+{
+    char msg[120];
+    json_str(msg, sizeof(msg), s_nt_msg);
+    int n = snprintf(buf, len, "{\"state\":\"%s\",\"msg\":%s}", NT_NAMES[s_nt], msg);
+    return n < 0 ? 0 : (size_t)n;
+}
+
+void app_apply_hostname(void)
+{
+    esp_netif_set_hostname(s_netif, settings_hostname());  // DHCP: sent on the next lease request
+    mdns_hostname_set(settings_hostname());
+    ESP_LOGI(TAG, "Hostname: %s (http://%s.local/)", settings_hostname(), settings_hostname());
+}
+
 static void health_task(void *arg)
 {
     bool wifi_restarted_this_outage = false;
-    s_ping_done = xSemaphoreCreateBinary();
 
     for (;;) {
         bool connected = xEventGroupGetBits(s_wifi_events) & CONNECTED_BIT;
-        uint32_t wait_s = (!connected || s_gw_fails) ? HEALTH_RETRY_S : CONFIG_APP_HEALTH_INTERVAL_S;
+        uint32_t wait_s = (!connected || s_gw_fails) ? HEALTH_RETRY_S : settings_health_s();
         vTaskDelay(pdMS_TO_TICKS(wait_s * 1000));
+        if (s_nt == NT_TESTING) {
+            continue;  // the network test owns the link right now
+        }
 
         if (!(xEventGroupGetBits(s_wifi_events) & CONNECTED_BIT)) {
             // Disconnected: the retry loop is working on it; step in only if it's taking too long.
             int64_t down_s = s_down_since_us ? (esp_timer_get_time() - s_down_since_us) / 1000000 : 0;
+            if (down_s >= FALLBACK_AP_S && net_revert_custom("Wi-Fi down for 2 min")) {
+                continue;
+            }
             if (down_s >= FALLBACK_AP_S && !prov_ap_active()) {
                 ESP_LOGW(TAG, "Health: Wi-Fi down for %lld s, opening setup AP as well", down_s);
                 prov_ap_start();
@@ -382,7 +610,11 @@ static void health_task(void *arg)
             esp_wifi_disconnect();  // -> DISCONNECTED -> retry with backoff
             break;
         case 3:
-            restart_wifi_driver();
+            if (net_revert_custom("gateway unreachable")) {
+                s_gw_fails = 1;  // fresh start with the defaults
+            } else {
+                restart_wifi_driver();
+            }
             break;
         default:
             reboot("gateway unreachable after Wi-Fi reconnect and driver restart");
@@ -429,7 +661,7 @@ static void led_off_cb(void *arg)
 static void led_flash(void)
 {
 #if !CONFIG_APP_CSI_MOTION
-    if (xEventGroupGetBits(s_wifi_events) & CONNECTED_BIT) {
+    if (settings()->led == LED_ACTIVITY && (xEventGroupGetBits(s_wifi_events) & CONNECTED_BIT)) {
         gpio_set_level(LED_GPIO, 1);
         esp_timer_stop(s_led_off_timer);
         esp_timer_start_once(s_led_off_timer, 30 * 1000);
@@ -437,11 +669,25 @@ static void led_flash(void)
 #endif
 }
 
+// LED modes (settings()->led): off; activity (default: blink while connecting, flash per request,
+// motion build: solid when connected, fast blink on motion); connected (solid while connected).
+// The BOOT button countdown drives the LED itself in every mode.
 static void led_task(void *arg)
 {
     int level = 0;
     for (uint32_t tick = 0;; tick++) {
-        if (!(xEventGroupGetBits(s_wifi_events) & CONNECTED_BIT)) {
+        xEventGroupClearBits(s_wifi_events, LED_KICK_BIT);
+        int mode = settings()->led;
+        bool up = xEventGroupGetBits(s_wifi_events) & CONNECTED_BIT;
+        if (mode == LED_OFF || (up && mode == LED_CONNECTED)) {
+            // Steady state: set the level and block until something changes, so this task never
+            // wakes the CPU while idle.
+            gpio_set_level(LED_GPIO, mode == LED_CONNECTED);
+            xEventGroupWaitBits(s_wifi_events, LED_KICK_BIT | (mode == LED_OFF ? 0 : DISCONNECTED_BIT),
+                                pdFALSE, pdFALSE, portMAX_DELAY);
+            continue;
+        }
+        if (!up) {
             level = (tick / 4) % 2;
 #if CONFIG_APP_CSI_MOTION
         } else if (motion_active()) {
@@ -451,16 +697,20 @@ static void led_task(void *arg)
         }
 #else
         } else {
-            // Connected and idle: LED off, and block until disconnected so this task never
-            // wakes the CPU.
+            // Activity mode, connected and idle: LED off until disconnected or the mode changes.
             gpio_set_level(LED_GPIO, 0);
-            xEventGroupWaitBits(s_wifi_events, DISCONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+            xEventGroupWaitBits(s_wifi_events, DISCONNECTED_BIT | LED_KICK_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
             continue;
         }
 #endif
         gpio_set_level(LED_GPIO, level);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+}
+
+void app_led_changed(void)
+{
+    xEventGroupSetBits(s_wifi_events, LED_KICK_BIT);
 }
 
 // ---------- BOOT button: hold BUTTON_RESET_S to factory reset ----------
@@ -514,6 +764,7 @@ static void button_task(void *arg)
             last_s = held_s;
         }
         gpio_set_level(LED_GPIO, 0);
+        app_led_changed();  // restore the LED mode's own state
         ESP_LOGI(TAG, "BOOT button released after %lld ms: no reset", (esp_timer_get_time() - t0) / 1000);
         gpio_intr_enable(BUTTON_GPIO);
     }
@@ -550,37 +801,21 @@ static void led_init(void)
 
 // ---------- HTTP ----------
 
-static const char PAGE[] =
-    "<!doctype html><html><head><meta charset=\"utf-8\">"
-    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>ESP32</title>"
-    "<style>body{font-family:system-ui,sans-serif;margin:2em;max-width:28em}"
-    "td{padding:.3em 1em .3em 0}td:first-child{color:#666}</style></head>"
-    "<body><h2>ESP32 status</h2><table id=\"t\"></table>"
-#if CONFIG_APP_CSI_MOTION
-    "<p><a href=\"/motion\">Wi-Fi motion sensor</a> · <a href=\"/update\">Firmware update</a>"
-    " · <a href=\"/settings\">Settings</a></p>"
-#else
-    "<p><a href=\"/api/power\">Power stats</a> · <a href=\"/api/wakes\">What wakes the radio</a>"
-    " · <a href=\"/update\">Firmware update</a>"
-    " · <a href=\"/settings\">Settings</a></p>"
-#endif
-    "<script>"
-    "async function upd(){try{const s=await (await fetch('/api/status')).json();"
-    "document.getElementById('t').innerHTML=Object.entries(s).map(([k,v])=>`<tr><td>${k}</td><td>${v}</td></tr>`).join('');}catch(e){}}"
-    "upd();setInterval(upd,2000);"
-    "</script></body></html>";
+static char s_device_json[200];  // fixed facts about the board, built once
 
-static esp_err_t root_get(httpd_req_t *req)
+static void device_info_init(void)
 {
-    s_requests++;
-    if (!settings_have_wifi()) {
-        httpd_resp_set_status(req, "302 Found");
-        httpd_resp_set_hdr(req, "Location", "/setup");
-        return httpd_resp_sendstr(req, "Redirect to setup");
-    }
-    led_flash();
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
-    return httpd_resp_send(req, PAGE, HTTPD_RESP_USE_STRLEN);
+    esp_chip_info_t chip;
+    esp_chip_info(&chip);
+    uint32_t flash = 0;
+    esp_flash_get_size(NULL, &flash);
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(s_device_json, sizeof(s_device_json),
+             "\"chip\":\"ESP32 rev v%d.%d, %d cores, %d MHz\",\"flash_mb\":%" PRIu32 ","
+             "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"idf\":\"%s\"",
+             chip.revision / 100, chip.revision % 100, chip.cores, CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+             flash >> 20, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], esp_get_idf_version());
 }
 
 static esp_err_t status_get(httpd_req_t *req)
@@ -601,26 +836,49 @@ static esp_err_t status_get(httpd_req_t *req)
         }
     }
     char ssid[80];
-    prov_json_str(ssid, sizeof(ssid), settings()->ssid);
+    json_str(ssid, sizeof(ssid), settings()->ssid);
     char ota[192];
     ota_status_json(ota, sizeof(ota));
-    char body[1024];
-    snprintf(body, sizeof(body),
+    char dns[16] = "";
+    esp_netif_dns_info_t di;
+    if (up && esp_netif_get_dns_info(s_netif, ESP_NETIF_DNS_MAIN, &di) == ESP_OK && di.ip.u_addr.ip4.addr) {
+        snprintf(dns, sizeof(dns), IPSTR, IP2STR(&di.ip.u_addr.ip4));
+    }
+    char now[40] = "null";
+    if (s_time_synced) {
+        now[0] = '"';
+        app_time_str(now + 1, sizeof(now) - 2);
+        strcat(now, "\"");
+    }
+    const char *avail = update_available();
+    int8_t tx = 0;
+    esp_wifi_get_max_tx_power(&tx);
+    char *body = malloc(1536);
+    if (!body) {
+        return httpd_resp_send_500(req);
+    }
+    snprintf(body, 1536,
              "{\"hostname\":\"%s\",\"ssid\":%s,\"connected\":%s,\"setup_ap\":%s,\"ip\":%s%s%s,"
-             "\"rssi_dbm\":%s,\"uptime_s\":%lld,\"reset_reason\":\"%s\",\"wifi_connects\":%" PRIu32 ","
+             "\"ip_mode\":\"%s\",\"dns\":\"%s\",\"rssi_dbm\":%s,\"tx_power_dbm\":%.1f,\"time\":%s,"
+             "\"uptime_s\":%lld,\"reset_reason\":\"%s\",\"wifi_connects\":%" PRIu32 ","
              "\"http_requests\":%" PRIu32 ",\"free_heap\":%" PRIu32 ",\"min_free_heap\":%" PRIu32 ","
              "\"power_save\":%s,\"gateway_ok\":%s,\"gateway_rtt_ms\":%" PRIu32 ","
              "\"gateway_fails\":%" PRIu32 ",\"gateway_checked_s_ago\":%lld,"
-             "\"recovery_reconnects\":%" PRIu32 ",\"recovery_wifi_restarts\":%" PRIu32 ",%s}",
-             HOSTNAME, ssid, up ? "true" : "false", prov_ap_active() ? "true" : "false",
-             up ? "\"" : "", ip, up ? "\"" : "",
-             rssi, esp_timer_get_time() / 1000000, reset_reason_str(), s_connects, s_requests,
+             "\"recovery_reconnects\":%" PRIu32 ",\"recovery_wifi_restarts\":%" PRIu32 ","
+             "\"recovery_net_reverts\":%" PRIu32 ",\"update_available\":%s%s%s,%s,%s}",
+             settings_hostname(), ssid, up ? "true" : "false", prov_ap_active() ? "true" : "false",
+             up ? "\"" : "", ip, up ? "\"" : "", settings()->ip ? "static" : "dhcp", dns,
+             rssi, tx / 4.0, now, esp_timer_get_time() / 1000000, reset_reason_str(), s_connects, s_requests,
              esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
              POWER_SAVE_JSON, s_gw_checked ? (s_gw_ok ? "true" : "false") : "null", s_gw_rtt_ms,
              s_gw_fails, s_gw_checked ? (esp_timer_get_time() - s_gw_last_check_us) / 1000000 : -1LL,
-             s_act_reconnects, s_act_wifi_restarts, ota);
+             s_act_reconnects, s_act_wifi_restarts, s_act_net_reverts,
+             avail ? "\"" : "", avail ? avail : "null", avail ? "\"" : "", ota, s_device_json);
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t err = httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+    free(body);
+    return err;
 }
 
 // GET /api/power: esp_pm profiling dump (time in each power mode since boot, and PM locks)
@@ -702,14 +960,14 @@ static esp_err_t motion_get_api(httpd_req_t *req)
 static void http_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 24;
+    cfg.max_uri_handlers = 40;
     cfg.lru_purge_enable = true;  // phones on the setup AP open many sockets
     httpd_handle_t server;
     ESP_ERROR_CHECK(httpd_start(&server, &cfg));
-    const httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get };
     const httpd_uri_t status = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get };
-    httpd_register_uri_handler(server, &root);
     httpd_register_uri_handler(server, &status);
+    web_register(server);
+    logbuf_register(server);
     const httpd_uri_t power = { .uri = "/api/power", .method = HTTP_GET, .handler = power_get };
     httpd_register_uri_handler(server, &power);
     const httpd_uri_t wakes = { .uri = "/api/wakes", .method = HTTP_GET, .handler = wakes_get };
@@ -729,12 +987,13 @@ static void http_start(void)
 static void mdns_start(void)
 {
     ESP_ERROR_CHECK(mdns_init());
-    mdns_hostname_set(HOSTNAME);
+    mdns_hostname_set(settings_hostname());
     mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
 }
 
 void app_main(void)
 {
+    logbuf_init();
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -744,6 +1003,10 @@ void app_main(void)
 
     ota_init();
     settings_load();
+    app_apply_tz();
+    device_info_init();
+    s_ping_done = xSemaphoreCreateBinary();
+    s_ping_lock = xSemaphoreCreateMutex();
     power_init();
     wifi_init();
     led_init();
