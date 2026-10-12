@@ -1,0 +1,8 @@
+backup/
+firmware/main/secrets.h
+firmware/build/
+firmware/managed_components/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/build-motion/
+firmware/.cache/

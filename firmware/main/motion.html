@@ -1,0 +1,63 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 motion</title>
+<style>
+:root{color-scheme:light dark}
+body{font-family:system-ui,sans-serif;margin:16px;max-width:760px}
+#st{font-size:2.2em;font-weight:600;padding:.35em .6em;border-radius:10px;background:#8882;transition:background .2s}
+#st.on{background:#e5484d;color:#fff}
+canvas{width:100%;height:240px;border:1px solid #8885;border-radius:8px;display:block}
+.row{color:#888;margin:.6em 0}
+input{vertical-align:middle}
+</style></head>
+<body>
+<h2>Wi-Fi motion sensor</h2>
+<div id="st">…</div>
+<p class="row" id="info"></p>
+<canvas id="c"></canvas>
+<p class="row">Trigger at <input id="s" type="range" min="1.2" max="4" step="0.1"> <span id="sv"></span>× baseline (lower = more sensitive)</p>
+<p class="row">Blue: CSI fluctuation score · dashed: trigger level · red bands: motion · last 60 s · <a href="/">status</a></p>
+<script>
+const $ = id => document.getElementById(id);
+const c = $('c'), x = c.getContext('2d'), H = [], N = 300;
+let busy = false;
+$('s').oninput = () => $('sv').textContent = (+$('s').value).toFixed(1);
+$('s').onchange = () => fetch('/api/motion?sens=' + $('s').value);
+
+async function tick() {
+  if (busy) return;
+  busy = true;
+  try {
+    const m = await (await fetch('/api/motion')).json();
+    m.threshold = m.baseline * m.sens;
+    H.push(m);
+    if (H.length > N) H.shift();
+    $('st').textContent = m.motion ? 'MOTION' : 'Still';
+    $('st').className = m.motion ? 'on' : '';
+    $('info').textContent = `score ${m.score.toFixed(2)} · baseline ${m.baseline.toFixed(2)} · ` +
+      `${m.csi_rate} CSI frames/s · ${m.events} events · RSSI ${m.rssi_dbm} dBm`;
+    if (document.activeElement !== $('s')) { $('s').value = m.sens; $('sv').textContent = m.sens.toFixed(1); }
+    draw();
+  } catch (e) {}
+  busy = false;
+}
+
+function draw() {
+  const r = devicePixelRatio, w = c.width = c.clientWidth * r, h = c.height = c.clientHeight * r;
+  const mx = Math.max(0.5, ...H.map(m => Math.max(m.score, m.threshold))) * 1.15;
+  const X = i => w * i / (N - 1), Y = v => h - h * v / mx;
+  x.fillStyle = '#e5484d40';
+  H.forEach((m, i) => { if (m.motion) x.fillRect(X(i), 0, w / (N - 1) + 1, h); });
+  const line = (f, col, dash) => {
+    x.setLineDash(dash.map(v => v * r)); x.strokeStyle = col; x.lineWidth = 2 * r; x.beginPath();
+    H.forEach((m, i) => i ? x.lineTo(X(i), Y(f(m))) : x.moveTo(X(i), Y(f(m))));
+    x.stroke();
+  };
+  line(m => m.threshold, '#888', [6, 6]);
+  line(m => m.score, '#3b82f6', []);
+}
+setInterval(tick, 200);
+tick();
+</script>
+</body></html>

@@ -1,0 +1,83 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 settings</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:2em;max-width:30em}
+td{padding:.25em 1em .25em 0}td:first-child{color:#666}
+h3{margin-top:1.8em}
+label{display:block;margin:.8em 0 .3em}
+input[type=password]{width:100%;box-sizing:border-box;padding:.45em}
+button{margin-top:1em;padding:.5em 1.2em}
+.danger{background:#c00;color:#fff;border:0;border-radius:4px}
+.hint{color:#666;font-size:.9em}
+.ok{color:#080}.err{color:#c00}
+p[id$=msg]{white-space:pre-wrap}
+</style></head>
+<body>
+<h2>Settings</h2>
+<table id="cur"></table>
+
+<h3>Wi-Fi network</h3>
+<p class="hint">To switch networks, use the <a href="/setup">setup page</a>. The new network is tested before it replaces the current one.</p>
+
+<h3 id="adm-h">Admin password</h3>
+<p class="hint" id="adm-hint">Protects firmware updates, Wi-Fi changes and reset.</p>
+<form id="adm">
+  <div id="adm-cur-w"><label for="adm-cur">Current admin password</label><input id="adm-cur" type="password"></div>
+  <label for="adm-new">New admin password (8+ characters)</label><input id="adm-new" type="password" maxlength="64">
+  <label for="adm-new2">Repeat new password</label><input id="adm-new2" type="password" maxlength="64">
+  <button type="submit">Save admin password</button>
+</form>
+<p id="adm-msg"></p>
+
+<h3>Factory reset</h3>
+<p class="hint">Forgets the Wi-Fi network and the admin password, then reboots into setup mode: the device
+opens the network <b>ESP32-Setup-XXXX</b> (WPA3, password <b>esp32setupXXXX</b>, same XXXX) until it is
+configured again. Firmware is kept.</p>
+<form id="rst">
+  <label for="rst-pw">Admin password</label><input id="rst-pw" type="password">
+  <button type="submit" class="danger">Reset to setup mode</button>
+</form>
+<p id="rst-msg"></p>
+
+<p><a href="/">Status</a> · <a href="/update">Firmware update</a></p>
+
+<script>
+const $ = id => document.getElementById(id);
+const say = (id, t, c) => { $(id).textContent = t; $(id).className = c || ''; };
+let adminSet = true;
+
+Promise.all([fetch('/api/status').then(r => r.json()), fetch('/api/setup').then(r => r.json())]).then(([s, p]) => {
+  const rows = [['network', p.ssid || '(none)'], ['IP', s.ip], ['signal', s.rssi_dbm + ' dBm'], ['firmware', s.firmware]];
+  $('cur').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td></td></tr>`).join('');
+  [...$('cur').querySelectorAll('td:last-child')].forEach((td, i) => td.textContent = rows[i][1]);
+  adminSet = p.admin_set;
+  if (!adminSet) {
+    $('adm-cur-w').hidden = true;
+    $('adm-h').textContent = 'Set an admin password';
+    $('adm-hint').textContent = 'No admin password is set yet: firmware updates and reset are disabled until you set one.';
+    $('adm-hint').className = 'err';
+  }
+}).catch(() => {});
+
+$('adm').onsubmit = async ev => {
+  ev.preventDefault();
+  const n = $('adm-new').value;
+  if (n.length < 8) return say('adm-msg', 'At least 8 characters.', 'err');
+  if (n !== $('adm-new2').value) return say('adm-msg', 'Passwords do not match.', 'err');
+  const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+  if (adminSet) headers['X-Admin-Password'] = $('adm-cur').value;
+  const r = await fetch('/api/admin', { method: 'POST', headers, body: new URLSearchParams({ new: n }) });
+  say('adm-msg', await r.text(), r.ok ? 'ok' : 'err');
+  if (r.ok) { adminSet = true; $('adm-cur-w').hidden = false; $('adm').reset(); }
+};
+
+$('rst').onsubmit = async ev => {
+  ev.preventDefault();
+  if (!confirm('Erase Wi-Fi settings and admin password, and reboot into setup mode?')) return;
+  const r = await fetch('/api/reset', { method: 'POST', headers: { 'X-Admin-Password': $('rst-pw').value } });
+  say('rst-msg', r.ok ? 'Settings erased. The device is rebooting into setup mode:\njoin "ESP32-Setup-XXXX" (password esp32setupXXXX) to configure it again.' : await r.text(), r.ok ? 'ok' : 'err');
+};
+</script>
+</body></html>

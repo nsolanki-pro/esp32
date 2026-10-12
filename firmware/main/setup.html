@@ -1,0 +1,130 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 setup</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:1.5em;max-width:28em}
+label{display:block;margin:.9em 0 .3em}
+input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:.5em;font-size:1em}
+button{margin-top:1.2em;padding:.6em 1.4em;font-size:1em}
+.net{display:flex;justify-content:space-between;padding:.45em .3em;border-bottom:1px solid #ddd;cursor:pointer}
+.net:hover{background:#f3f3f3}.dim{color:#777}
+#msg{margin-top:1em;white-space:pre-wrap}
+.ok{color:#080}.err{color:#c00}.warn{color:#a60}
+.hint{color:#666;font-size:.9em}
+</style></head>
+<body>
+<h2>ESP32 Wi-Fi setup</h2>
+<p id="intro" class="hint"></p>
+
+<div><button type="button" id="scan">Scan for networks</button></div>
+<div id="nets"></div>
+
+<form id="f" autocomplete="off">
+  <label for="ssid">Network name (SSID)</label>
+  <input id="ssid" name="ssid" type="text" maxlength="32" required>
+  <label for="pass">Wi-Fi password</label>
+  <input id="pass" name="pass" type="password" maxlength="63">
+  <label><input type="checkbox" id="show"> show password</label>
+
+  <div id="newadmin">
+    <label for="admin">Choose an admin password <span class="hint">(8+ characters; needed for updates and reset)</span></label>
+    <input id="admin" type="password" maxlength="64">
+    <label for="admin2">Repeat admin password</label>
+    <input id="admin2" type="password" maxlength="64">
+  </div>
+  <div id="curadmin" hidden>
+    <label for="cur">Current admin password</label>
+    <input id="cur" type="password" maxlength="64">
+  </div>
+  <button id="go" type="submit">Connect and save</button>
+</form>
+<div id="msg"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const msg = (t, c) => { $('msg').textContent = t; $('msg').className = c || ''; };
+let st = {};
+
+async function state() { return (await fetch('/api/setup', { cache: 'no-store' })).json(); }
+
+state().then(s => {
+  st = s;
+  $('intro').textContent = s.configured
+    ? `Currently set to "${s.ssid}". Saving new settings replaces it; the admin password is required.`
+    : 'Pick your 2.4 GHz network and enter its password. The device tests the connection before saving.';
+  if (s.admin_set) { $('newadmin').hidden = true; $('curadmin').hidden = false; }
+  if (s.configured) $('ssid').value = s.ssid;
+}).catch(() => {});
+
+$('show').onchange = () => { $('pass').type = $('show').checked ? 'text' : 'password'; };
+
+$('scan').onclick = async () => {
+  $('scan').disabled = true;
+  $('nets').innerHTML = '<p class="dim">Scanning...</p>';
+  try {
+    const r = await (await fetch('/api/scan', { cache: 'no-store' })).json();
+    if (r.error) throw new Error(r.error);
+    $('nets').innerHTML = '';
+    for (const n of r.networks) {
+      const d = document.createElement('div');
+      d.className = 'net';
+      const bars = n.rssi > -55 ? '▂▄▆█' : n.rssi > -67 ? '▂▄▆' : n.rssi > -78 ? '▂▄' : '▂';
+      d.innerHTML = '<span></span><span class="dim"></span>';
+      d.firstChild.textContent = n.ssid + (n.open ? ' (open)' : '');
+      d.lastChild.textContent = `${bars} ${n.rssi} dBm`;
+      d.onclick = () => { $('ssid').value = n.ssid; $('pass').value = ''; $('pass').focus(); };
+      $('nets').appendChild(d);
+    }
+    if (!r.networks.length) $('nets').innerHTML = '<p class="dim">No networks found. Type the name below.</p>';
+  } catch (e) {
+    $('nets').innerHTML = `<p class="err">Scan failed (${e.message}). Type the name below.</p>`;
+  }
+  $('scan').disabled = false;
+};
+
+$('f').onsubmit = async ev => {
+  ev.preventDefault();
+  const ssid = $('ssid').value, pass = $('pass').value;
+  if (pass && pass.length < 8) return msg('Wi-Fi password must be at least 8 characters (or empty for an open network).', 'err');
+  const body = new URLSearchParams({ ssid, pass });
+  const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+  if (st.admin_set) {
+    if (!$('cur').value) return msg('Enter the current admin password.', 'err');
+    headers['X-Admin-Password'] = $('cur').value;
+  } else {
+    if ($('admin').value.length < 8) return msg('Admin password must be at least 8 characters.', 'err');
+    if ($('admin').value !== $('admin2').value) return msg('Admin passwords do not match.', 'err');
+    body.set('admin', $('admin').value);
+  }
+  $('go').disabled = true;
+  msg(`Connecting to "${ssid}"...`, 'warn');
+  try {
+    const r = await fetch('/api/setup', { method: 'POST', headers, body });
+    if (!r.ok) { msg(await r.text(), 'err'); $('go').disabled = false; return; }
+  } catch (e) { /* the AP may switch channel right after replying; keep polling */ }
+  poll(Date.now());
+};
+
+function poll(t0) {
+  setTimeout(async () => {
+    const secs = Math.round((Date.now() - t0) / 1000);
+    let s;
+    try { s = await state(); } catch (e) {
+      if (secs > 90) { msg('Lost contact with the device. Reconnect to its setup network and reload this page.', 'err'); $('go').disabled = false; return; }
+      msg(`Connecting... (your phone may briefly drop the setup network) ${secs} s`, 'warn');
+      return poll(t0);
+    }
+    if (s.state === 'ok') {
+      msg(`Connected to "${s.trial_ssid}" and saved.\n\nThe device is rebooting. Switch your phone back to "${s.trial_ssid}", then open:\n  http://${s.ip}/\n  http://esp32.local/`, 'ok');
+    } else if (s.state === 'failed') {
+      msg(`Could not connect: ${s.msg}. Check and try again.`, 'err');
+      $('go').disabled = false;
+    } else {
+      msg(`Connecting to "${s.trial_ssid}"... ${secs} s`, 'warn');
+      poll(t0);
+    }
+  }, 1500);
+}
+</script>
+</body></html>

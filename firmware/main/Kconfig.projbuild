@@ -1,0 +1,36 @@
+menu "App"
+
+    config APP_CSI_MOTION
+        bool "Wi-Fi CSI motion sensor (radio always on, disables power save)"
+        default n
+        select ESP_WIFI_CSI_ENABLED
+        help
+            Detect movement from Wi-Fi channel state information. Needs the receiver on
+            continuously (~100+ mA), so light sleep and Wi-Fi power save are turned off.
+
+    config APP_LISTEN_INTERVAL
+        int "Wi-Fi power save: wake every N beacons"
+        depends on !APP_CSI_MOTION
+        range 1 10
+        default 3
+        help
+            The radio sleeps between beacons and wakes every N beacon intervals (~102 ms each)
+            to check for buffered traffic. Higher = lower power, slower first response.
+
+    config APP_HEALTH_INTERVAL_S
+        int "Gateway health check interval (s)"
+        range 30 3600
+        default 300
+        help
+            Ping the gateway this often. On failure it rechecks every 30 s and escalates:
+            1st failure: recheck, 2nd: reconnect Wi-Fi, 3rd: restart Wi-Fi driver, 4th: reboot.
+
+    config APP_DOWN_REBOOT_S
+        int "Reboot if Wi-Fi stays disconnected this long (s)"
+        range 300 86400
+        default 900
+        help
+            Backstop for stuck states. The Wi-Fi driver is restarted once after 5 min down;
+            if it is still down after this many seconds, the chip reboots.
+
+endmenu
