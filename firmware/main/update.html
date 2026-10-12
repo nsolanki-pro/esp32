@@ -5,23 +5,33 @@
 <style>
 body{font-family:system-ui,sans-serif;margin:2em;max-width:32em}
 td{padding:.25em 1em .25em 0}td:first-child{color:#666}
+h3{margin-top:1.6em}
 label{display:block;margin:.8em 0 .3em}
 input[type=password]{width:100%;box-sizing:border-box;padding:.4em}
 button{margin-top:1em;padding:.5em 1.2em}
 progress{width:100%;height:1.2em;margin-top:1em}
-#msg{margin-top:1em;white-space:pre-wrap}
-.ok{color:#080}.err{color:#c00}.warn{color:#a60}
+#msg,#rel-info{margin-top:1em;white-space:pre-wrap}
+.ok{color:#080}.err{color:#c00}.warn{color:#a60}.hint{color:#666;font-size:.9em}
 </style></head>
 <body>
 <h2>Firmware update</h2>
 <table id="cur"></table>
 
-<label for="file">Firmware image (<code>build/esp32_status.bin</code>)</label>
-<input id="file" type="file" accept=".bin">
 <label for="tok">Admin password</label>
 <input id="tok" type="password" autocomplete="off">
 <label><input id="remember" type="checkbox"> remember in this browser</label>
-<button id="go">Upload</button>
+
+<h3>Latest release</h3>
+<p class="hint" id="repo"></p>
+<div id="rel-info">Checking GitHub...</div>
+<button id="check">Check again</button>
+<button id="install" hidden>Install</button>
+
+<h3>Upload a file</h3>
+<p class="hint">An <code>-ota.bin</code> from a release, or <code>build/esp32_status.bin</code> from your own build.</p>
+<input id="file" type="file" accept=".bin">
+<br><button id="go">Upload</button>
+
 <progress id="prog" value="0" max="1" hidden></progress>
 <div id="msg"></div>
 <p><a href="/">Status</a> · <a href="/settings">Settings</a></p>
@@ -29,37 +39,103 @@ progress{width:100%;height:1.2em;margin-top:1em}
 <script>
 const $ = id => document.getElementById(id);
 const msg = (text, cls) => { $('msg').textContent = text; $('msg').className = cls || ''; };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const buttons = ['check', 'install', 'go'];
+const lock = on => buttons.forEach(b => $(b).disabled = on);
 let before = null;
 
 try { const t = localStorage.getItem('admin_pw'); if (t) { $('tok').value = t; $('remember').checked = true; } } catch (e) {}
 
-async function status() {
-  const r = await fetch('/api/status', { cache: 'no-store' });
-  return r.json();
+function password() {
+  const tok = $('tok').value.trim();
+  if (!tok) { msg('Enter the admin password.', 'err'); $('tok').focus(); return null; }
+  try { $('remember').checked ? localStorage.setItem('admin_pw', tok) : localStorage.removeItem('admin_pw'); } catch (e) {}
+  return tok;
 }
+
+async function status() { return (await fetch('/api/status', { cache: 'no-store' })).json(); }
+async function upd() { return (await fetch('/api/update', { cache: 'no-store' })).json(); }
 
 function showCurrent(s) {
   const rows = [['firmware', s.firmware], ['built', s.built], ['partition', s.partition],
                 ['on probation', s.ota_pending], ['last rollback', s.rolled_back_from ?? 'none'],
                 ['uptime', s.uptime_s + ' s']];
-  $('cur').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+  $('cur').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td></td></tr>`).join('');
+  [...$('cur').querySelectorAll('td:last-child')].forEach((td, i) => td.textContent = rows[i][1]);
 }
 
-status().then(s => { before = s; showCurrent(s); }).catch(() => {});
+// ----- latest GitHub release -----
+
+function showRelease(u) {
+  $('repo').textContent = `From github.com/${u.repo} (${u.variant} build)`;
+  const info = $('rel-info');
+  $('install').hidden = true;
+  if (u.state === 'failed') { info.textContent = 'Check failed: ' + u.msg; info.className = 'err'; return; }
+  if (!u.checked) return;
+  if (u.newer) {
+    info.textContent = `Update available: ${u.latest} (installed: ${u.current}).`;
+    info.className = 'warn';
+    $('install').textContent = `Install ${u.latest}`;
+    $('install').hidden = false;
+  } else {
+    info.textContent = `Up to date: ${u.current} (latest release: ${u.latest}).`;
+    info.className = 'ok';
+  }
+}
+
+// Ask the device to (re)check GitHub, then wait for the result.
+async function check() {
+  lock(true);
+  $('rel-info').textContent = 'Checking GitHub...'; $('rel-info').className = '';
+  try {
+    const r = await fetch('/api/update/check', { method: 'POST' });
+    if (!r.ok && r.status !== 409) throw new Error(await r.text());
+    let u;
+    do { await sleep(700); u = await upd(); } while (u.state === 'checking');
+    showRelease(u);
+  } catch (e) { $('rel-info').textContent = 'Check failed: ' + e.message; $('rel-info').className = 'err'; }
+  lock(false);
+}
+
+$('check').onclick = check;
+
+$('install').onclick = async () => {
+  const tok = password();
+  if (!tok) return;
+  try { before = await status(); } catch (e) {}
+  lock(true);
+  msg('Starting...');
+  const r = await fetch('/api/update/install', { method: 'POST', headers: { 'X-Admin-Password': tok } });
+  if (r.status !== 202) { msg(`Rejected (${r.status}): ${await r.text()}`, 'err'); lock(false); return; }
+  $('prog').hidden = false; $('prog').value = 0;
+  for (;;) {
+    await sleep(1000);
+    let u;
+    try { u = await upd(); } catch (e) { break; }  // device went away: it is rebooting
+    if (u.state === 'failed') { msg('Update failed: ' + u.msg, 'err'); $('prog').hidden = true; lock(false); return; }
+    if (u.size) $('prog').value = u.done / u.size;
+    if (u.state === 'rebooting') break;
+    msg(u.state === 'downloading' && u.done ? `Downloading ${u.latest}: ${Math.round(u.done / 1024)} / ${Math.round(u.size / 1024)} KB`
+                                            : 'Contacting GitHub...');
+  }
+  $('prog').value = 1;
+  msg('Installed and verified. Waiting for the board to reboot...');
+  watch();
+};
+
+// ----- upload a file -----
 
 $('go').onclick = async () => {
   const f = $('file').files[0];
-  const tok = $('tok').value.trim();
   if (!f) return msg('Choose a .bin file first.', 'err');
-  if (!tok) return msg('Enter the admin password.', 'err');
+  const tok = password();
+  if (!tok) return;
   const head = new Uint8Array(await f.slice(0, 1).arrayBuffer());
-  if (head[0] !== 0xE9) return msg('That is not an ESP32 app image (send build/esp32_status.bin).', 'err');
-  try { $('remember').checked ? localStorage.setItem('admin_pw', tok) : localStorage.removeItem('admin_pw'); } catch (e) {}
+  if (head[0] !== 0xE9) return msg('That is not an ESP32 app image (use the -ota.bin, not -full.bin).', 'err');
 
   try { before = await status(); } catch (e) {}
-  $('go').disabled = true;
-  $('prog').hidden = false;
-  $('prog').value = 0;
+  lock(true);
+  $('prog').hidden = false; $('prog').value = 0;
   msg(`Uploading ${f.name} (${f.size} bytes)...`);
 
   const xhr = new XMLHttpRequest();
@@ -67,13 +143,9 @@ $('go').onclick = async () => {
   xhr.setRequestHeader('X-Admin-Password', tok);
   xhr.setRequestHeader('Content-Type', 'application/octet-stream');
   xhr.upload.onprogress = e => { if (e.lengthComputable) $('prog').value = e.loaded / e.total; };
-  xhr.onerror = () => { msg('Upload failed (connection error).', 'err'); $('go').disabled = false; };
+  xhr.onerror = () => { msg('Upload failed (connection error).', 'err'); lock(false); };
   xhr.onload = () => {
-    if (xhr.status !== 200) {
-      msg(`Rejected (${xhr.status}): ${xhr.responseText}`, 'err');
-      $('go').disabled = false;
-      return;
-    }
+    if (xhr.status !== 200) { msg(`Rejected (${xhr.status}): ${xhr.responseText}`, 'err'); lock(false); return; }
     $('prog').value = 1;
     msg(xhr.responseText + 'Waiting for the board to reboot...');
     watch();
@@ -94,13 +166,14 @@ function watch() {
     showCurrent(s);
     if (s.partition === oldPart) {
       msg(`Update rolled back: ${s.rolled_back_from} did not confirm. Still running ${s.firmware} on ${s.partition}.`, 'err');
-      $('go').disabled = false;
+      lock(false);
     } else if (!s.ota_pending) {
       msg(`Done: running ${s.firmware} on ${s.partition}, confirmed.`, 'ok');
-      $('go').disabled = false;
+      lock(false);
+      check();
     } else if (secs > 420) {
       msg('Timed out waiting for confirmation.', 'err');
-      $('go').disabled = false;
+      lock(false);
     } else {
       msg(`Running ${s.firmware} on ${s.partition}, on probation: waiting for the gateway check (rollback after 5 min)... ${secs} s`, 'warn');
       setTimeout(tick, 3000);
@@ -108,5 +181,8 @@ function watch() {
   };
   setTimeout(tick, 3000);
 }
+
+status().then(s => { before = s; showCurrent(s); }).catch(() => {});
+check();
 </script>
 </body></html>

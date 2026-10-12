@@ -5,6 +5,7 @@
 //   GET /api/wakes   received-frame counters by kind, i.e. what wakes the radio (?reset=1 clears)
 //   GET /update      firmware upload page (browser)
 //   GET /setup, /settings and their APIs: see provision.h
+//   GET /api/update, POST /api/update/{check,install}: install the latest GitHub release (update.h)
 //   POST /api/ota    firmware update (see ota.h; or use ../ota.sh)
 //
 // Self-healing: Wi-Fi retries with exponential backoff (2 s .. 60 s) on any disconnect, failed
@@ -48,6 +49,7 @@
 #include "nvs_flash.h"
 #include "ota.h"
 #include "provision.h"
+#include "update.h"
 #include "lwip/ip_addr.h"
 #include "ping/ping_sock.h"
 #include "rxstats.h"
@@ -714,6 +716,7 @@ static void http_start(void)
     httpd_register_uri_handler(server, &wakes);
     ota_register(server);
     prov_register(server);
+    update_register(server);
 #if CONFIG_APP_CSI_MOTION
     const httpd_uri_t mpage = { .uri = "/motion", .method = HTTP_GET, .handler = motion_page_get };
     const httpd_uri_t mapi = { .uri = "/api/motion", .method = HTTP_GET, .handler = motion_get_api };
@@ -745,6 +748,7 @@ void app_main(void)
     wifi_init();
     led_init();
     button_init();
+    update_init();
     if (settings_have_wifi()) {
         xTaskCreate(health_task, "health", 3072, NULL, 3, NULL);
     }

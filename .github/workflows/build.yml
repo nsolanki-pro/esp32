@@ -69,13 +69,21 @@ jobs:
         run: |
           cd dist
           sha256sum *.bin > SHA256SUMS
+          # manifest.json: what the device's "install latest release" reads (see firmware/main/update.h)
+          v=$GITHUB_REF_NAME
+          entry() { printf '"%s_ota":"%s","%s_size":%s,"%s_sha256":"%s"' \
+                      "$2" "$1" "$2" "$(stat -c %s "$1")" "$2" "$(sha256sum "$1" | cut -d' ' -f1)"; }
+          printf '{"version":"%s",%s,%s}\n' "$v" "$(entry "esp32-$v-ota.bin" default)" \
+                 "$(entry "esp32-$v-motion-ota.bin" motion)" > manifest.json
+          cat manifest.json
           cat > notes.md <<'EOF'
           **Files**
           - `*-ota.bin`: app image for over-the-air updates (`/update` page or `ota.sh`)
           - `*-full.bin`: complete flash image for a new or erased board, written over USB at offset 0:
             `esptool.py --chip esp32 -b 115200 write_flash 0x0 esp32-<version>-full.bin`
           - `*-motion-*`: CSI motion-sensor build (radio always on, no light sleep)
+          - `manifest.json`: read by the device's *Install latest release* button on `/update`
 
           After flashing, the board opens the setup network `ESP32-Setup-XXXX` (password `esp32setupXXXX`).
           EOF
-          gh release create "$GITHUB_REF_NAME" *.bin SHA256SUMS --title "$GITHUB_REF_NAME" --notes-file notes.md --generate-notes
+          gh release create "$GITHUB_REF_NAME" *.bin SHA256SUMS manifest.json --title "$GITHUB_REF_NAME" --notes-file notes.md --generate-notes

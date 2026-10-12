@@ -1,5 +1,5 @@
-// Push OTA: the image is streamed straight from the HTTP request into the inactive OTA slot, so
-// no RAM buffer the size of the image is needed. The bootloader is built with
+// OTA: images are streamed into the inactive OTA slot (no RAM buffer the size of the image), either
+// pushed to POST /api/ota or pulled from a GitHub release by update.c. The bootloader is built with
 // CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, so a new image boots on probation (see ota.h).
 
 #include "ota.h"
@@ -99,6 +99,159 @@ size_t ota_status_json(char *buf, size_t len)
     return n < 0 ? 0 : (size_t)n < len ? (size_t)n : len - 1;
 }
 
+// ---------- image writer (shared by push upload and pull from GitHub) ----------
+
+static portMUX_TYPE s_w_lock = portMUX_INITIALIZER_UNLOCKED;
+static struct {
+    bool active;
+    esp_ota_handle_t handle;
+    const esp_partition_t *target;
+    size_t total, done;
+    wifi_ps_type_t ps;
+    int64_t t0;
+    int status;  // HTTP status that fits the last error
+} s_w;
+
+static const char *w_err(int status, const char *msg)
+{
+    s_w.status = status;
+    ESP_LOGE(TAG, "update rejected: %s", msg);
+    return msg;
+}
+
+int ota_writer_status(void)
+{
+    return s_w.status;
+}
+
+bool ota_writer_busy(void)
+{
+    return s_w.active;
+}
+
+const char *ota_writer_begin(size_t total)
+{
+    if (s_pending) {
+        return w_err(409, "running firmware not confirmed yet; wait a minute and retry");
+    }
+    const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
+    if (!target) {
+        return w_err(500, "no OTA partition");
+    }
+    if (total <= APP_DESC_OFFSET + sizeof(esp_app_desc_t) || total > target->size) {
+        return w_err(400, "bad image size");
+    }
+    bool busy;
+    portENTER_CRITICAL(&s_w_lock);
+    busy = s_w.active;
+    s_w.active = true;
+    portEXIT_CRITICAL(&s_w_lock);
+    if (busy) {
+        return w_err(409, "another update is in progress");
+    }
+    s_w.handle = 0;
+    s_w.target = target;
+    s_w.total = total;
+    s_w.done = 0;
+    s_w.t0 = esp_timer_get_time();
+    // Stay awake with the radio on for the transfer: light sleep / modem sleep would make it crawl.
+    s_w.ps = WIFI_PS_NONE;
+    esp_wifi_get_ps(&s_w.ps);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_pm_lock_acquire(s_no_sleep);
+    esp_pm_lock_acquire(s_cpu_max);
+    return NULL;
+}
+
+const char *ota_writer_write(const void *data, size_t n)
+{
+    const char *buf = data;
+    if (s_w.done + n > s_w.total) {
+        return w_err(400, "more data than announced");
+    }
+    if (s_w.done == 0) {
+        // First chunk: refuse anything that isn't an app image for this project.
+        if (n < APP_DESC_OFFSET + sizeof(esp_app_desc_t)) {
+            return w_err(500, "first chunk too small");
+        }
+        const esp_image_header_t *hdr = (const esp_image_header_t *)buf;
+        const esp_app_desc_t *desc = (const esp_app_desc_t *)(buf + APP_DESC_OFFSET);
+        const esp_app_desc_t *cur = esp_app_get_description();
+        if (hdr->magic != ESP_IMAGE_HEADER_MAGIC || desc->magic_word != ESP_APP_DESC_MAGIC_WORD) {
+            return w_err(400, "not an ESP32 app image (send the -ota.bin / build/<project>.bin, not a full flash image)");
+        }
+        if (hdr->chip_id != CONFIG_IDF_FIRMWARE_CHIP_ID) {
+            return w_err(400, "image built for a different chip");
+        }
+        if (strncmp(desc->project_name, cur->project_name, sizeof(desc->project_name)) != 0) {
+            return w_err(400, "image is for a different project");
+        }
+        ESP_LOGI(TAG, "receiving %s (%u bytes) into %s", desc->version, (unsigned)s_w.total, s_w.target->label);
+        esp_err_t e = esp_ota_begin(s_w.target, OTA_WITH_SEQUENTIAL_WRITES, &s_w.handle);
+        if (e != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_begin: %s", esp_err_to_name(e));
+            s_w.handle = 0;
+            return w_err(500, "could not start update");
+        }
+    }
+    if (esp_ota_write(s_w.handle, buf, n) != ESP_OK) {
+        return w_err(500, "flash write failed");
+    }
+    s_w.done += n;
+    return NULL;
+}
+
+const char *ota_writer_finish(void)
+{
+    if (s_w.done != s_w.total) {
+        return w_err(400, "upload incomplete");
+    }
+    esp_err_t e = esp_ota_end(s_w.handle);  // verifies the whole image (segments + SHA-256)
+    s_w.handle = 0;
+    if (e == ESP_ERR_OTA_VALIDATE_FAILED) {
+        return w_err(400, "image failed verification (corrupt or truncated)");
+    }
+    if (e != ESP_OK || esp_ota_set_boot_partition(s_w.target) != ESP_OK) {
+        return w_err(500, "could not finalise update");
+    }
+    ESP_LOGI(TAG, "update written in %lld ms, next boot from %s", (esp_timer_get_time() - s_w.t0) / 1000,
+             s_w.target->label);
+    return NULL;  // stays "active" with power locks held: the caller reboots
+}
+
+void ota_writer_abort(void)
+{
+    if (!s_w.active) {
+        return;
+    }
+    if (s_w.handle) {
+        esp_ota_abort(s_w.handle);
+        s_w.handle = 0;
+    }
+    esp_pm_lock_release(s_cpu_max);
+    esp_pm_lock_release(s_no_sleep);
+    esp_wifi_set_ps(s_w.ps);
+    s_w.active = false;
+}
+
+const char *ota_writer_target(void)
+{
+    return s_w.target ? s_w.target->label : "?";
+}
+
+int ota_writer_elapsed_ms(void)
+{
+    return (int)((esp_timer_get_time() - s_w.t0) / 1000);
+}
+
+void ota_reboot(void)
+{
+    vTaskDelay(pdMS_TO_TICKS(500));  // let responses and log lines out
+    esp_restart();
+}
+
+// ---------- push: POST /api/ota ----------
+
 // Read exactly `want` bytes (fewer only at the end of the body). Returns bytes read, or -1.
 static int recv_full(httpd_req_t *req, char *buf, int want)
 {
@@ -117,129 +270,66 @@ static int recv_full(httpd_req_t *req, char *buf, int want)
     return got;
 }
 
-static esp_err_t fail(httpd_req_t *req, const char *status, const char *msg)
+static esp_err_t fail(httpd_req_t *req, int status, const char *msg)
 {
-    ESP_LOGE(TAG, "update rejected: %s", msg);
-    httpd_resp_set_status(req, status);
+    httpd_resp_set_status(req, status == 400 ? "400 Bad Request" : status == 409 ? "409 Conflict"
+                                                                                 : "500 Internal Server Error");
     httpd_resp_set_type(req, "text/plain");
-    httpd_resp_sendstr(req, msg);
-    return ESP_OK;
+    httpd_resp_sendstr_chunk(req, msg);
+    httpd_resp_sendstr_chunk(req, "\n");
+    return httpd_resp_sendstr_chunk(req, NULL);
 }
 
 extern const char update_html_start[] asm("_binary_update_html_start");
 extern const char update_html_end[] asm("_binary_update_html_end");
 
-// GET /update: browser upload page (posts to /api/ota)
+// GET /update: browser page (upload a file, or install the latest release; see update.c)
 static esp_err_t update_page_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_send(req, update_html_start, update_html_end - update_html_start);
 }
 
-// POST /api/ota
 static esp_err_t ota_post(httpd_req_t *req)
 {
     if (!settings_require_admin(req)) {
         return ESP_OK;
     }
-    if (s_pending) {
-        return fail(req, "409 Conflict", "running firmware not confirmed yet; wait and retry\n");
+    const char *err = ota_writer_begin(req->content_len > 0 ? req->content_len : 0);
+    if (err) {
+        return fail(req, ota_writer_status(), err);
     }
-    const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
-    int total = req->content_len;
-    if (!target) {
-        return fail(req, "500 Internal Server Error", "no OTA partition\n");
-    }
-    if (total <= (int)(APP_DESC_OFFSET + sizeof(esp_app_desc_t)) || total > (int)target->size) {
-        return fail(req, "400 Bad Request", "bad image size\n");
-    }
-
     char *buf = malloc(CHUNK);
     if (!buf) {
-        return fail(req, "500 Internal Server Error", "out of memory\n");
+        ota_writer_abort();
+        return fail(req, 500, "out of memory");
     }
-
-    // Stay awake with the radio on for the transfer: light sleep / modem sleep would make it crawl.
-    wifi_ps_type_t ps = WIFI_PS_NONE;
-    esp_wifi_get_ps(&ps);
-    esp_wifi_set_ps(WIFI_PS_NONE);
-    esp_pm_lock_acquire(s_no_sleep);
-    esp_pm_lock_acquire(s_cpu_max);
-
-    const char *err = NULL;
-    const char *status = "400 Bad Request";
-    esp_ota_handle_t ota = 0;
-    int64_t t0 = esp_timer_get_time();
-    int done = 0;
-
+    size_t total = req->content_len, done = 0;
     while (done < total && !err) {
         int want = total - done < CHUNK ? total - done : CHUNK;
-        int n = recv_full(req, buf, want);
-        if (n != want) {
-            err = "upload interrupted\n";
+        if (recv_full(req, buf, want) != want) {
+            err = "upload interrupted";
+            s_w.status = 400;
             break;
         }
-        if (done == 0) {
-            // First chunk: refuse anything that isn't an app image for this project.
-            const esp_image_header_t *hdr = (const esp_image_header_t *)buf;
-            const esp_app_desc_t *desc = (const esp_app_desc_t *)(buf + APP_DESC_OFFSET);
-            const esp_app_desc_t *cur = esp_app_get_description();
-            if (hdr->magic != ESP_IMAGE_HEADER_MAGIC || desc->magic_word != ESP_APP_DESC_MAGIC_WORD) {
-                err = "not an ESP32 app image (send build/<project>.bin, not a merged/flash image)\n";
-            } else if (hdr->chip_id != CONFIG_IDF_FIRMWARE_CHIP_ID) {
-                err = "image built for a different chip\n";
-            } else if (strncmp(desc->project_name, cur->project_name, sizeof(desc->project_name)) != 0) {
-                err = "image is for a different project\n";
-            } else {
-                ESP_LOGI(TAG, "receiving %s (%d bytes) into %s", desc->version, total, target->label);
-                esp_err_t e = esp_ota_begin(target, OTA_WITH_SEQUENTIAL_WRITES, &ota);
-                if (e != ESP_OK) {
-                    ESP_LOGE(TAG, "esp_ota_begin: %s", esp_err_to_name(e));
-                    err = "could not start update\n";
-                    status = "500 Internal Server Error";
-                }
-            }
-            if (err) {
-                break;
-            }
-        }
-        if (esp_ota_write(ota, buf, n) != ESP_OK) {
-            err = "flash write failed\n";
-            status = "500 Internal Server Error";
-            break;
-        }
-        done += n;
-    }
-
-    if (!err) {
-        esp_err_t e = esp_ota_end(ota);  // verifies the whole image (segments + SHA-256)
-        ota = 0;
-        if (e == ESP_ERR_OTA_VALIDATE_FAILED) {
-            err = "image failed verification (corrupt or truncated)\n";
-        } else if (e != ESP_OK || esp_ota_set_boot_partition(target) != ESP_OK) {
-            err = "could not finalise update\n";
-            status = "500 Internal Server Error";
-        }
-    } else if (ota) {
-        esp_ota_abort(ota);
+        err = ota_writer_write(buf, want);
+        done += want;
     }
     free(buf);
-
+    if (!err) {
+        err = ota_writer_finish();
+    }
     if (err) {
-        esp_pm_lock_release(s_cpu_max);
-        esp_pm_lock_release(s_no_sleep);
-        esp_wifi_set_ps(ps);
+        int status = ota_writer_status();
+        ota_writer_abort();
         return fail(req, status, err);
     }
-
-    int ms = (int)((esp_timer_get_time() - t0) / 1000);
-    ESP_LOGI(TAG, "update written in %d ms, rebooting into %s", ms, target->label);
     char msg[96];
-    snprintf(msg, sizeof(msg), "ok: %d bytes in %d ms, rebooting into %s\n", total, ms, target->label);
+    snprintf(msg, sizeof(msg), "ok: %u bytes in %d ms, rebooting into %s\n", (unsigned)total,
+             ota_writer_elapsed_ms(), ota_writer_target());
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_sendstr(req, msg);
-    vTaskDelay(pdMS_TO_TICKS(500));  // let the response and the log line out
-    esp_restart();
+    ota_reboot();
     return ESP_OK;
 }
 

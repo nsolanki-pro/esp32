@@ -33,4 +33,11 @@ menu "App"
             Backstop for stuck states. The Wi-Fi driver is restarted once after 5 min down;
             if it is still down after this many seconds, the chip reboots.
 
+config APP_UPDATE_REPO
+        string "GitHub repository for firmware updates"
+        default "nsolanki-pro/esp32"
+        help
+            owner/name of the GitHub repository whose latest release the device offers to install
+            (see update.h). Leave empty to disable updates from GitHub.
+
 endmenu
